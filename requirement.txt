@@ -1,0 +1,3 @@
+google-generativeai
+streamlit
+streamlit-mic-recorder
