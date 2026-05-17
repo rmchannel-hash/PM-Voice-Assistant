@@ -8,6 +8,11 @@ Human-in-the-loop gating at every pipeline stage.
 Setup:
   .streamlit/secrets.toml  →  GEMINI_API_KEY = "your-key"
 """
+from memory import OperationalMemory
+from dependency_graph import DependencyGraph
+from lifecycle_engine import LifecycleAdvisor
+from reasoning import PMReasoningEngine
+from vector_store import PMOVectorStore
 
 import streamlit as st
 import google.generativeai as genai
