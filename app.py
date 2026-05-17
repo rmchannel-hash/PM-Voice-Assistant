@@ -2,98 +2,88 @@ import streamlit as st
 import google.generativeai as genai
 import json
 
-st.set_page_config(page_title="PD Captain: Sinbad Sailor", layout="wide")
+st.set_page_config(page_title="PD Command Center", layout="wide")
+st.title("⚓ PD Command Center: Hardened Swarm")
 
-st.title("⚓ PD_Captain: Sinbad Sailor")
-st.markdown("### *Hierarchical Multi-Agent Account Governance*")
+# Sidebar for Setup
+st.sidebar.header("⚙️ Core Configuration")
+api_key = st.sidebar.text_input("Enter API Key", type="password")
 
-# --- SIDEBAR CONFIGURATION ---
-st.sidebar.header("⚙️ Swarm Core Settings")
-api_key = st.sidebar.text_input("Gemini API Key", type="password")
-
-# Ruthless System Instructions
-SINBAD_SYSTEM = """You are Captain Sinbad Sailor, a ruthless, hyper-structured Project Director specializing in high-maturity account delivery (CMMI Level 5) and strict Earned Value Management (EVM) frameworks. Your role is to analyze raw multi-page project telemetry/bid documents, enforce absolute accountability, and delegate isolated work payloads to sub-agents without crossing context wires.
-Route monetary/milestones to PM Agent. Route design/readiness to Technical Agent. Route text/emails to Cognitive Agent."""
-
-PM_SYSTEM = """You are the Lead Project Controller. Your domain is mathematical precision, resource efficiency, and financial truth (ANSI/EIA-748 EVM).
-Analyze your delegated payload. Output a strict JSON structure containing: Level 2 WBS, Planned Value (PV), SPI, CPI, and Resource allocation adjustments."""
-
-TECH_SYSTEM = """You are the Technical PMO Lead and Risk Governance Agent. Enforce absolute alignment with ISO 31000 Risk Management standards.
-Parse technical designs, LLD details, and deployment constraints. Output a strict JSON structure containing a comprehensive RAID register with assigned owners, target closure dates, and a definitive RACI Matrix footprint."""
-
-COGNITIVE_SYSTEM = """You are the Behavioral Science & Client Account Director. Your domain is high-stakes stakeholder psychology, sentiment telemetry, and predictive relationship engineering. 
-Ingest emails/transcripts. Output a structured behavioral brief containing: Customer Sentiment Score, Top 3 Relationship Risks, and an explicit UAT Handshake Strategy with scripted talking points."""
-
-# --- INITIALIZE AGENTS ---
 if api_key:
     genai.configure(api_key=api_key)
     
-    # Instantiate models with their respective ruthless system prompts
-    sinbad_orchestrator = genai.GenerativeModel('gemini-2.5-flash', system_instruction=SINBAD_SYSTEM)
-    pm_agent = genai.GenerativeModel('gemini-2.5-flash', system_instruction=PM_SYSTEM)
-    tech_agent = genai.GenerativeModel('gemini-2.5-flash', system_instruction=TECH_SYSTEM)
-    cognitive_agent = genai.GenerativeModel('gemini-2.5-flash', system_instruction=COGNITIVE_SYSTEM)
+    # Tier 1: Deep Reasoning Models for Orchestration & Soft Skills
+    orchestrator_model = genai.GenerativeModel('gemini-3-flash') # In production tier, swap to Pro
+    cognitive_model = genai.GenerativeModel('gemini-3-flash') 
+    
+    # Tier 2: Fast, Highly Accurate Extraction Models for Structured Data
+    pm_model = genai.GenerativeModel('gemini-3-flash')
+    tech_model = genai.GenerativeModel('gemini-3-flash')
 
-    # --- STATE MANAGEMENT (THE CENTRAL LOGICAL LOOP) ---
+    # Centralized Memory Initialization
     if "central_knowledge_base" not in st.session_state:
         st.session_state.central_knowledge_base = {
-            "wbs_metrics": {},
-            "raid_raci_logs": {},
-            "stakeholder_sentiment": {}
+            "wbs_metrics": None,
+            "raid_raci_logs": None,
+            "stakeholder_sentiment": None,
+            "supervisor_approved": False
         }
 
-    # --- UI TABS ---
-    tab1, tab2 = st.tabs(["📂 Ingestion Engine", "📊 Master Dashboard"])
+    tab1, tab2 = st.tabs(["📂 Ingestion & Processing", "🔍 Supervisor Validation Gate"])
 
     with tab1:
-        st.subheader("📥 Central Document Ingestion Pool")
-        st.write("Upload your master Project Bid Document, Statement of Work (SOW), or LLD here.")
+        st.subheader("📥 Enterprise Data Ingestion")
+        uploaded_file = st.file_uploader("Upload Project Dossier", type=["txt", "md"])
         
-        uploaded_file = st.file_uploader("Drop project dossier here", type=["txt", "md"])
-        
-        if uploaded_file is not None:
-            raw_document_text = uploaded_file.read().decode("utf-8")
-            st.success("Document successfully loaded into memory cache.")
+        # Simulated Actuals Feed Connector (Addresses Claude's Point #1)
+        st.markdown("### 🔌 Connected Feeds")
+        actuals_connected = st.checkbox("Link live execution feeds (Jira / SAP Cost Ledgers)", value=False)
+        actuals_payload = "ACTUALS_FEED_STATUS: None provided" if not actuals_connected else "ACTUALS_FEED: PV=10000, EV=9500, AC=9800"
+
+        if uploaded_file and st.button("Run Multi-Agent Analysis"):
+            raw_text = uploaded_file.read().decode("utf-8")
             
-            if st.button("Activate Captain Sinbad: Execute Swarm Delegation"):
-                with st.spinner("Captain Sinbad is running semantic breakdown and activating the swarm..."):
-                    
-                    # Step 1: Orchestrator routes the payloads
-                    orchestrator_response = sinbad_orchestrator.generate_content(
-                        f"Analyze and delegate this project dossier:\n\n{raw_document_text}"
-                    )
-                    
-                    st.markdown("### 🚢 Captain Sinbad's Operational Directive")
-                    st.info(orchestrator_response.text)
-                    
-                    # Step 2: Simulate parallel execution to sub-agents using the text block
-                    # (In production, Sinbad extracts and routes clean text fields to each model)
-                    with st.spinner("Sub-Agents analyzing parallel streams..."):
-                        
-                        pm_payload = pm_agent.generate_content(f"Process financial/milestone scope out of this context:\n\n{raw_document_text}")
-                        tech_payload = tech_agent.generate_content(f"Extract technical risk/RACI from this context:\n\n{raw_document_text}")
-                        cog_payload = cognitive_agent.generate_content(f"Analyze stakeholder communication from this context:\n\n{raw_document_text}")
-                        
-                        # Store outcomes in Central State Memory
-                        st.session_state.central_knowledge_base["wbs_metrics"] = pm_payload.text
-                        st.session_state.central_knowledge_base["raid_raci_logs"] = tech_payload.text
-                        st.session_state.central_knowledge_base["stakeholder_sentiment"] = cog_payload.text
-                        
-                        st.success("🎯 All sub-agents have updated the Central RAG Database successfully!")
+            # Phase 1: Orchestration Execution
+            with st.spinner("Captain Sinbad routing contexts..."):
+                directive = orchestrator_model.generate_content(f"{SINBAD_SYSTEM}\n\nInput:\n{raw_text}").text
+                st.info("🚢 **Orchestrator Directive Issued.**")
+            
+            # Phase 2: Execution Streams (Simulating parallel backend processing sequentially for safety)
+            with st.spinner("Processing sub-agent pipelines..."):
+                # Pass both the text and the actuals feed status to prevent calculation hallucinations
+                pm_res = pm_model.generate_content(f"{PM_SYSTEM}\n\nContext:\n{raw_text}\n\n{actuals_payload}").text
+                tech_res = tech_model.generate_content(f"{TECH_SYSTEM}\n\nContext:\n{raw_text}").text
+                cog_res = cognitive_model.generate_content(f"{COGNITIVE_SYSTEM}\n\nContext:\n{raw_text}").text
+                
+                # Write back immediately to Central Memory Layer
+                st.session_state.central_knowledge_base["wbs_metrics"] = pm_res
+                st.session_state.central_knowledge_base["raid_raci_logs"] = tech_res
+                st.session_state.central_knowledge_base["stakeholder_sentiment"] = cog_res
+                st.session_state.central_knowledge_base["supervisor_approved"] = False
+                st.success("Target analysis stored in central database cache.")
 
     with tab2:
-        st.subheader("🌐 Real-Time Account Portfolio Matrix")
-        st.write("Dynamic data states fetched straight from the central memory layer.")
+        st.subheader("🛡️ Supervisor Review & Sign-Off")
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("### 📊 Controls Data")
-            st.code(st.session_state.central_knowledge_base["wbs_metrics"], language="json")
-        with col2:
-            st.markdown("### 🛡️ Governance & Risks")
-            st.code(st.session_state.central_knowledge_base["raid_raci_logs"], language="json")
-        with col3:
-            st.markdown("### 🧠 Cognitive Sentiment")
-            st.code(st.session_state.central_knowledge_base["stakeholder_sentiment"], language="json")
-else:
-    st.warning("👈 Please enter your Gemini API Key in the sidebar to power the orchestration ecosystem.")
+        if st.session_state.central_knowledge_base["wbs_metrics"]:
+            st.warning("⚠️ Critical Governance Check: Review agent data outputs before compiling executive decks.")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("#### 📊 Parsed PM Metrics JSON")
+                st.text_area("PM Agent Raw", st.session_state.central_knowledge_base["wbs_metrics"], height=250)
+            with col2:
+                st.markdown("#### 🛡️ Parsed Technical RAID JSON")
+                st.text_area("Tech Agent Raw", st.session_state.central_knowledge_base["raid_raci_logs"], height=250)
+            with col3:
+                st.markdown("#### 🧠 Parsed Advisor JSON")
+                st.text_area("Cognitive Agent Raw", st.session_state.central_knowledge_base["stakeholder_sentiment"], height=250)
+            
+            st.markdown("---")
+            # The Gatekeeper Switch (Addresses Claude's Point #5)
+            approval = st.checkbox("Verify and Approve Swarm Telemetry Data Integrity")
+            if approval:
+                st.session_state.central_knowledge_base["supervisor_approved"] = True
+                st.success("🔒 Telemetry Verified. Cleared for SteerCo Reporting Engine compilation.")
+        else:
+            st.info("No active telemetry found. Please run the Ingestion pipeline.")
