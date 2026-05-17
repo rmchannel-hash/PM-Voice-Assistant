@@ -702,14 +702,20 @@ if st.session_state["stage"] >= 2 and st.session_state.get("pm_output"):
             evm = pm.get("evm_summary", {})
 
             m1, m2, m3, m4 = st.columns(4)
-            spi_val = evm.get("spi", 0)
-            cpi_val = evm.get("cpi", 0)
+            # Safe numeric coercion — AI may return None or string for any field
+            def safe_num(val, default=0.0):
+                try:
+                    return float(val) if val is not None else default
+                except (TypeError, ValueError):
+                    return default
+            spi_val = safe_num(evm.get("spi"), 0.0)
+            cpi_val = safe_num(evm.get("cpi"), 0.0)
             m1.metric("SPI", f"{spi_val:.2f}", delta="⚠ BREACH" if spi_val < 0.95 else "OK",
                       delta_color="inverse" if spi_val < 0.95 else "normal")
             m2.metric("CPI", f"{cpi_val:.2f}", delta="⚠ BREACH" if cpi_val < 0.95 else "OK",
                       delta_color="inverse" if cpi_val < 0.95 else "normal")
-            m3.metric("EAC ₹Cr", f"{evm.get('eac', 0):.1f}")
-            m4.metric("TCPI", f"{evm.get('tcpi', 0):.3f}")
+            m3.metric("EAC ₹Cr", f"{safe_num(evm.get('eac')):.1f}")
+            m4.metric("TCPI", f"{safe_num(evm.get('tcpi')):.3f}")
 
             if evm.get("governance_breach"):
                 st.error("🚨 Governance breach — SPI or CPI below 0.95 threshold")
@@ -718,8 +724,12 @@ if st.session_state["stage"] >= 2 and st.session_state.get("pm_output"):
             if wbs:
                 st.subheader("WBS Packages")
                 for pkg in wbs:
-                    pct = pkg.get("pct_complete", 0)
-                    st.markdown(f"**{pkg.get('id')} — {pkg.get('name')}**")
+                    # Safely coerce pct_complete — AI may return None, string, or float
+                    try:
+                        pct = max(0, min(100, int(float(pkg.get("pct_complete") or 0))))
+                    except (TypeError, ValueError):
+                        pct = 0
+                    st.markdown(f"**{pkg.get('id','?')} — {pkg.get('name','Unknown')}**")
                     c1, c2, c3 = st.columns([3, 1, 1])
                     c1.progress(pct / 100)
                     c2.markdown(f"**{pct}%**")
