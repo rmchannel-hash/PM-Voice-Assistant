@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import asyncio
+import time
 from datetime import datetime
 
 # ═══════════════════════════════════════════════════════
@@ -323,20 +324,47 @@ class DualRAGStore:
 #  Uses threading to avoid Streamlit event loop conflicts
 # ═══════════════════════════════════════════════════════
 
-def call_gemini_sync(system_prompt: str, user_message: str, model_name: str = "gemini-2.0-flash") -> str:
+def call_gemini_sync(system_prompt: str, user_message: str, model_name: str = "gemini-2.5-flash") -> str:
     """
-    Calls Gemini API synchronously.
+    Calls Gemini API synchronously with exponential backoff retry.
+    Handles 429 quota errors gracefully — retries up to 4 times.
     Safe for Streamlit — no asyncio conflicts.
     """
-    try:
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system_prompt
-        )
-        response = model.generate_content(user_message)
-        return response.text
-    except Exception as e:
-        return f"ERROR: {str(e)}"
+    MAX_RETRIES = 4
+    BACKOFF_SECONDS = [10, 20, 40, 60]
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=system_prompt
+            )
+            response = model.generate_content(user_message)
+            return response.text
+
+        except Exception as e:
+            err_str = str(e)
+
+            # 429 quota / rate limit — wait and retry
+            if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
+                if attempt < MAX_RETRIES:
+                    wait = BACKOFF_SECONDS[attempt]
+                    delay_match = re.search(r"retry.*?(\d+(?:\.\d+)?)\s*s", err_str, re.IGNORECASE)
+                    if delay_match:
+                        wait = min(int(float(delay_match.group(1))) + 5, 90)
+                    time.sleep(wait)
+                    continue
+                else:
+                    return (
+                        "QUOTA_EXCEEDED: Gemini free tier limit reached after retries. "
+                        "Enable billing at https://aistudio.google.com — costs less than Rs 5 for a demo. "
+                        "Original error: " + err_str
+                    )
+
+            # Any other error — fail immediately
+            return f"ERROR: {err_str}"
+
+    return "ERROR: Max retries exceeded."
 
 
 def call_agents_concurrent(payloads: list) -> list:
@@ -478,7 +506,7 @@ def run_orchestrator(revision_notes: str = ""):
         user_msg = f"REVISION REQUEST FROM PM DIRECTOR:\n{revision_notes}\n\n---\nORIGINAL SOURCE:\n{source_text}"
 
     with st.spinner("🎖 Captain Sinbad Sailor — ingesting and routing..."):
-        output = call_gemini_sync(ORCHESTRATOR_PROMPT, user_msg, "gemini-2.0-flash")
+        output = call_gemini_sync(ORCHESTRATOR_PROMPT, user_msg, "gemini-2.5-flash")
 
     st.session_state["orchestrator_output"] = output
     st.session_state["gate_1"] = "pending"
@@ -497,9 +525,9 @@ def run_parallel_agents(revision_notes: str = ""):
         return base
 
     payloads = [
-        (PM_PROMPT,        build_payload("PM_CONTROLS_PAYLOAD"),       "gemini-2.0-flash"),
-        (RISK_PROMPT,      build_payload("TECHNICAL_RISK_PAYLOAD"),     "gemini-2.0-flash"),
-        (COGNITIVE_PROMPT, build_payload("STAKEHOLDER_ADVISOR_PAYLOAD"),"gemini-2.0-flash"),
+        (PM_PROMPT,        build_payload("PM_CONTROLS_PAYLOAD"),       "gemini-2.5-flash"),
+        (RISK_PROMPT,      build_payload("TECHNICAL_RISK_PAYLOAD"),     "gemini-2.5-flash"),
+        (COGNITIVE_PROMPT, build_payload("STAKEHOLDER_ADVISOR_PAYLOAD"),"gemini-2.5-flash"),
     ]
 
     with st.spinner("📊🛡🧠 Running 3 agents concurrently (threaded)..."):
@@ -539,7 +567,7 @@ def run_arbitration(revision_notes: str = ""):
         user_msg = f"REVISION REQUEST FROM PM DIRECTOR:\n{revision_notes}\n\n---\n" + user_msg
 
     with st.spinner("⚖️ Captain Sinbad — conflict arbitration..."):
-        output = call_gemini_sync(ARBITRATION_PROMPT, user_msg, "gemini-2.0-flash")
+        output = call_gemini_sync(ARBITRATION_PROMPT, user_msg, "gemini-2.5-flash")
 
     st.session_state["arbitration_output"] = output
     st.session_state["gate_3"]             = "pending"
@@ -563,7 +591,7 @@ def run_reporting(revision_notes: str = ""):
         user_msg = f"REVISION REQUEST FROM PM DIRECTOR:\n{revision_notes}\n\n---\n" + user_msg
 
     with st.spinner("📋 Reporting Engine — consolidating SteerCo brief..."):
-        output = call_gemini_sync(REPORTING_PROMPT, user_msg, "gemini-2.0-flash")
+        output = call_gemini_sync(REPORTING_PROMPT, user_msg, "gemini-2.5-flash")
 
     st.session_state["report_output"] = output
     st.session_state["gate_4"]        = "pending"
