@@ -1,3 +1,6 @@
 google-generativeai
 streamlit
 streamlit-mic-recorder
+google-generativeai>=0.8.0
+streamlit>=1.35.0
+asyncio
