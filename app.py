@@ -255,5 +255,5 @@ def safe_parse_json(raw_text, fallback_schema):
         return fallback_schema
     clean_text = raw_text.strip()
     if clean_text.startswith("```"):
-        match = re.search(r"
+        match = re.search(r"```json(.*?)```", raw_text, re.DOTALL)
 http://googleusercontent.com/immersive_entry_chip/0
