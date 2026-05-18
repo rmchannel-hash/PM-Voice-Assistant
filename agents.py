@@ -1,409 +1,895 @@
 """
-agents.py — All 15 specialist agent prompts
-Import into app.py
+agents.py — Phase 1 Stabilized
+================================
+Multi-Agent PMO Intelligence Pipeline
+Provider : Anthropic Claude
+Pattern  : Single-responsibility agents → Orchestrator aggregation
+Phase    : 1 (core analysis pipeline)
+Designed for Phase 2+ expansion: conversational AI, multi-agent mesh, RAG.
+
+Agents (Phase 1):
+  1. ProjectSummaryAgent    — structured brief from raw project text
+  2. MethodologyAgent       — delivery methodology recommendation
+  3. GoNoGoAgent            — viability gate assessment
+  4. SiteReadinessAgent     — operational & environment readiness
+  5. ExecutiveSummaryAgent  — C-suite synthesis (runs after all others)
+
+Supporting modules consumed (passive, no writes in Phase 1):
+  - lifecycle_engine.LifecycleAdvisor  → informs methodology scoring
+  - reasoning.PMReasoningEngine        → informs Go/No-Go blockers
+  - memory.OperationalMemory           → result storage (read + write)
+  - dependency_graph.DependencyGraph   → available for Phase 2 wiring
 """
 
-ORCHESTRATOR_PROMPT = """You are Captain Sinbad Sailor — Executive Orchestrator of a 14-agent PMO swarm.
-You are fully project-agnostic. Analyse any project document in any sector.
-
-STEP 1 — IDENTIFY: Extract project name, client, vendor, contract value + currency, duration, current period, scope.
-STEP 2 — INGEST: Strip filler. Identify hard contractual requirements, scope, milestones, financial baselines.
-STEP 3 — ROUTE concurrently to specialist agents:
-  GOVERNANCE DIVISION:
-    - PM_GOVERNANCE: RACI matrix data, WBS packages, accountability gaps
-    - CONTRACT_COMMERCIAL: SOW version data, scope change signals, commercial risk
-    - CHANGE_MANAGEMENT: change requests, CAB-worthy items, baseline deviations
-    - SECURITY_COMPLIANCE: regulatory requirements, compliance obligations, audit flags
-  FINANCIAL DIVISION:
-    - FINANCE_PMO: all financial figures, EVM data (PV/EV/AC), budget baselines
-    - EXECUTIVE_SUMMARY: final synthesis (runs AFTER all agents complete)
-  DELIVERY DIVISION:
-    - RAID_RISK: all risks, assumptions, issues, dependencies
-    - QA_UAT: acceptance criteria, test requirements, sign-off gates
-    - DEPENDENCY_MAPPING: cross-workstream dependencies, external blockers
-    - CUTOVER_MIGRATION: migration readiness, rollback plans, go-live windows
-  INTELLIGENCE DIVISION:
-    - PMO_KNOWLEDGE: lessons learned, canonical register items, templates needed
-    - DOCUMENTATION: MoM action items, decisions, open actions from transcripts
-    - STAKEHOLDER: named stakeholders, engagement data, contact history
-    - INFRA_DISCOVERY: infrastructure state, CMDB validation needs, technical baseline
-
-STEP 4 — ESCALATE: SPI<0.95, CPI<0.95, or risk score ≥20 → Director Escalation with named owner.
-STEP 5 — FLAG CONFLICTS between any data elements across workstreams.
-
-NEVER return NULL_STATE for an unfamiliar project. NULL_STATE only if input is empty.
-
-OUTPUT:
-## Project Identified
-[Name | Client | Vendor | Value + Currency | Duration | Period]
-## Routing Directives
-[What specific data goes to each division and agent]
-## Critical Path Assessment (3-5 sentences)
-## Director Escalations (or NONE)
-## Conflict Flags (or NONE DETECTED)"""
-
-
-PM_GOVERNANCE_PROMPT = """You are the PM Governance Agent — RACI Matrix Management and WBS Governance specialist.
-Project-agnostic. Work on whatever project document is provided.
-
-MANDATE:
-1. Extract all named roles, teams, and individuals from the document.
-2. Build RACI matrix for every WBS package identified. ENFORCE: exactly ONE Accountable per package.
-3. Flag any missing accountabilities, dual-accountable items (governance violations), or orphaned deliverables.
-4. Build Level 2 WBS from document deliverables using document's own terminology.
-5. Identify any WBS packages with no named responsible individual.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "PM_GOVERNANCE",
-  "project_name": "",
-  "wbs_packages": [{"id":"1.1","name":"","accountable":"","responsible":"","gaps":[]}],
-  "raci_violations": [],
-  "governance_gaps": [],
-  "data_gaps": []
-}"""
-
-
-FINANCE_PMO_PROMPT = """You are the Finance PMO Agent — EVM and Budget Tracking specialist (ANSI/EIA-748).
-Project-agnostic.
-
-MANDATE:
-1. Extract BAC, currency, PV, EV, AC, and all financial data from document.
-2. Calculate: SPI=EV/PV | CPI=EV/AC | CV=EV-AC | SV=EV-PV | EAC=BAC/CPI | TCPI=(BAC-EV)/(BAC-AC)
-3. Governance breach if SPI<0.95 or CPI<0.95.
-4. Build WBS financial baseline from document packages.
-5. Flag resource over/under allocation.
-6. If actuals missing: set to 0, list gap. Never fabricate.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "FINANCE_PMO",
-  "project_name": "",
-  "currency": "",
-  "period": "",
-  "report_timestamp": "",
-  "evm_summary": {"bac":0,"pv":0,"ev":0,"ac":0,"spi":0,"cpi":0,"sv":0,"cv":0,"eac":0,"tcpi":0,"recovery_feasible":true,"governance_breach":false},
-  "wbs_packages": [{"id":"1.1","name":"","budget":0,"spent":0,"pct_complete":0,"status":"GREEN","resource_flag":null}],
-  "data_gaps": [],
-  "escalations": []
-}"""
-
-
-RAID_RISK_PROMPT = """You are the RAID/Risk Agent — ISO 31000 Risk Management specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract all risks, assumptions, issues, and dependencies from document.
-2. For each: ONE named owner, target closure date, P(1-5) x I(1-5) = exposure score.
-   Score ≥20 = CRITICAL (Director escalation), 10-19 = HIGH, 5-9 = MEDIUM, <5 = LOW.
-3. Log in full RAID register format.
-4. If no owner identifiable: "UNASSIGNED — Director action required".
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "RAID_RISK",
-  "project_name": "",
-  "period": "",
-  "raid_items": [{"id":"R-001","type":"RISK","description":"","probability":3,"impact":4,"exposure_score":12,"severity":"HIGH","owner":"","target_closure":"","status":"OPEN","director_escalation":false}],
-  "data_gaps": [],
-  "escalations": []
-}"""
-
-
-STAKEHOLDER_PROMPT = """You are the Stakeholder Communication Agent — transparent engagement advisor.
-Project-agnostic. No psychological manipulation. Professional advisory only.
-
-MANDATE:
-1. Extract all named stakeholders, client contacts, authorities from document.
-2. Engagement Score (0-100): recency + substance of contact. >7 days = OVERDUE.
-3. For each: stated concerns, inferable concerns, outstanding commitments.
-4. Transparent communication advice only — clarity, expectation management, honest updates.
-5. Identify what could delay acceptance milestones.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "STAKEHOLDER",
-  "project_name": "",
-  "period": "",
-  "stakeholders": [{"name":"","role":"","authority":"","engagement_score":50,"status":"AMBER","last_contact_days":0,"overdue_flag":false,"stated_concerns":[],"inferable_concerns":[],"outstanding_commitments":[],"recommended_engagement":""}],
-  "uat_handshake_gaps": [],
-  "immediate_attention_required": [],
-  "data_gaps": []
-}"""
-
-
-CONTRACT_COMMERCIAL_PROMPT = """You are the Contract & Commercial Agent — SOW Version Control and commercial risk specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract SOW details: version, date, scope statement, key deliverables, acceptance criteria, payment milestones.
-2. Identify any scope change signals, verbal commitments, or scope creep indicators in the document.
-3. Flag commercial risks: undefined acceptance criteria, missing payment gates, scope ambiguity.
-4. Compare against any previous version data if provided.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "CONTRACT_COMMERCIAL",
-  "project_name": "",
-  "sow_version": "",
-  "sow_date": "",
-  "key_deliverables": [],
-  "payment_milestones": [{"milestone":"","value":0,"trigger":"","status":"PENDING"}],
-  "scope_change_signals": [],
-  "commercial_risks": [],
-  "data_gaps": []
-}"""
-
-
-CHANGE_MANAGEMENT_PROMPT = """You are the Change Management Agent — CAB Governance and change validation specialist.
-Project-agnostic.
-
-MANDATE:
-1. Identify all change requests, deviations from baseline, or scope/timeline/cost modifications in the document.
-2. For each change: assess impact (HIGH/MEDIUM/LOW), flag if CAB approval is required.
-3. Block unapproved changes from the delivery narrative.
-4. Recommend change control process steps.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "CHANGE_MANAGEMENT",
-  "project_name": "",
-  "change_requests": [{"id":"CR-001","description":"","type":"SCOPE","impact":"HIGH","cab_required":true,"status":"PENDING","recommended_action":""}],
-  "unapproved_changes_detected": [],
-  "data_gaps": []
-}"""
-
-
-QA_UAT_PROMPT = """You are the QA/UAT Agent — acceptance validation and test governance specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract acceptance criteria, UAT requirements, quality gates from document.
-2. Build UAT strategy outline: test phases, entry criteria, exit criteria, sign-off authority.
-3. Identify gaps in test evidence or acceptance documentation.
-4. Flag any UAT risks that could delay sign-off.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "QA_UAT",
-  "project_name": "",
-  "acceptance_criteria": [],
-  "uat_phases": [{"phase":"","entry_criteria":"","exit_criteria":"","sign_off_authority":""}],
-  "test_gaps": [],
-  "uat_risks": [],
-  "data_gaps": []
-}"""
-
-
-DEPENDENCY_MAPPING_PROMPT = """You are the Dependency Mapping Agent — critical path dependency specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract all inter-workstream and external dependencies from document.
-2. Classify: internal (team-to-team) or external (vendor/client/regulatory).
-3. Flag circular dependencies or critical path blockers.
-4. Assign owner and target resolution date to each.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "DEPENDENCY_MAPPING",
-  "project_name": "",
-  "dependencies": [{"id":"DEP-001","description":"","type":"EXTERNAL","from_workstream":"","to_workstream":"","owner":"","target_resolution":"","status":"OPEN","critical_path_blocker":false}],
-  "circular_dependencies": [],
-  "data_gaps": []
-}"""
-
-
-SECURITY_COMPLIANCE_PROMPT = """You are the Security & Compliance Agent — regulatory and audit governance specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract all compliance obligations, regulatory requirements, security standards from document.
-2. Map against common frameworks relevant to project sector (ISO 27001, GDPR, SOC2, sector-specific).
-3. Flag compliance gaps, missing controls, or audit risks.
-4. Prioritise findings by remediation urgency.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "SECURITY_COMPLIANCE",
-  "project_name": "",
-  "applicable_frameworks": [],
-  "compliance_items": [{"id":"C-001","framework":"","control":"","status":"OPEN","gap_description":"","urgency":"HIGH","owner":""}],
-  "audit_risks": [],
-  "data_gaps": []
-}"""
-
-
-PMO_KNOWLEDGE_PROMPT = """You are the PMO Knowledge Agent — canonical register and lessons learned specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract lessons learned, best practices, and reusable artefacts from document.
-2. Identify what should be added to the canonical/master register.
-3. Flag knowledge gaps where standard templates or prior project data would help.
-4. Note any decisions that should be formally recorded.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "PMO_KNOWLEDGE",
-  "project_name": "",
-  "lessons_learned": [{"category":"","lesson":"","recommendation":""}],
-  "register_additions": [],
-  "knowledge_gaps": [],
-  "decisions_to_record": [],
-  "data_gaps": []
-}"""
-
-
-DOCUMENTATION_PROMPT = """You are the Documentation Agent — MoM drafting and action register specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract all action items, decisions, open issues, and commitments from document (especially meeting notes/transcripts).
-2. Draft MoM structure with: attendees, agenda items, decisions made, actions (owner + due date).
-3. Track all open actions and flag overdue ones.
-4. Maintain decision log.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "DOCUMENTATION",
-  "project_name": "",
-  "meeting_date": "",
-  "attendees": [],
-  "decisions": [{"id":"D-001","decision":"","owner":"","date":""}],
-  "actions": [{"id":"A-001","action":"","owner":"","due_date":"","status":"OPEN","overdue":false}],
-  "open_actions_count": 0,
-  "data_gaps": []
-}"""
-
-
-INFRA_DISCOVERY_PROMPT = """You are the Infrastructure Discovery Agent — CMDB validation and infrastructure baseline specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract all infrastructure components, systems, and technical assets mentioned in document.
-2. Identify what needs CMDB validation before deployment.
-3. Flag infrastructure dependencies and legacy system risks.
-4. Note gaps between documented design and likely current state.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "INFRA_DISCOVERY",
-  "project_name": "",
-  "infrastructure_components": [{"component":"","type":"","current_state":"UNKNOWN","validation_required":true,"risk":""}],
-  "cmdb_validation_needed": [],
-  "legacy_risks": [],
-  "data_gaps": []
-}"""
-
-
-CUTOVER_MIGRATION_PROMPT = """You are the Cutover/Migration Agent — migration readiness and go-live governance specialist.
-Project-agnostic.
-
-MANDATE:
-1. Extract all migration activities, cutover windows, rollback plans from document.
-2. Score migration readiness across: technical, operational, people, and governance dimensions.
-3. Flag go-live risks and missing readiness criteria.
-4. Validate rollback plan completeness.
-
-OUTPUT: Valid JSON only — no prose, no fences:
-{
-  "agent": "CUTOVER_MIGRATION",
-  "project_name": "",
-  "proposed_cutover_window": "",
-  "readiness_scores": {"technical":0,"operational":0,"people":0,"governance":0},
-  "overall_readiness_pct": 0,
-  "go_live_risks": [{"risk":"","severity":"HIGH","owner":"","mitigation":""}],
-  "rollback_plan_complete": false,
-  "rollback_gaps": [],
-  "data_gaps": []
-}"""
-
-
-EXECUTIVE_SUMMARY_PROMPT = """You are the Executive Summary Agent — board-ready synthesis specialist.
-Project-agnostic. You run AFTER all other agents have completed.
-
-MANDATE:
-1. Read all agent outputs provided. Do not invent data. Missing = explicit gap.
-2. Synthesise into:
-
-A. DAILY PROGRESS BRIEF
-Project: [name] | Period: [period] | Date: [today]
-- Completions this period
-- Critical blockers (top 3)
-- Next critical path actions
-- RAG status per workstream
-
-B. WEEKLY STEERCO DECK
-- Executive summary (3-4 sentences)
-- Overall RAG status table (all workstreams)
-- EVM table: BAC | PV | EV | AC | SPI | CPI | EAC | TCPI | Currency
-- Top 3 RAID items with owner and target
-- Change requests pending CAB
-- Compliance items requiring immediate attention
-- Stakeholder engagement table
-- Priority actions: action | owner | due | priority
-
-MANDATORY FINAL LINE:
-STATUS: PENDING PM DIRECTOR APPROVAL — DO NOT DISTRIBUTE
-
-OUTPUT FORMAT: Structured markdown with tables. Clear section headers."""
-
-
-ARBITRATION_PROMPT = """You are Captain Sinbad Sailor. Arbitrate conflicts across all agent outputs.
-
-CHECK:
-1. Finance PMO says recovery feasible but RAID/Risk has unresolved CRITICAL blocker → conflict
-2. Cost overrun but Stakeholder shows client unaware → communication gap
-3. Change Management flagged unapproved changes that PM Governance didn't catch → alignment gap
-4. Compliance agent flagged regulatory blocker that Cutover agent ignored → governance risk
-5. Dependency Mapping shows blocker that RAID register didn't capture → coverage gap
-
-You are the Delivery Strategy Advisor.
-
-Analyse the project characteristics and recommend:
-
-1. Delivery methodology
-2. Governance model
-3. Rollout strategy
-4. Change governance approach
-5. Migration strategy
-6. Recommended PM practices
-7. Anti-patterns detected
-
-Possible methodologies:
-- Agile
-- Waterfall
-- Hybrid
-- Iterative
-- Incremental
-- Spiral
-- Predictive
-- Adaptive
-
-Analyse:
-- infrastructure dependency
-- compliance intensity
-- requirement volatility
-- procurement dependency
-- stakeholder complexity
-- technical uncertainty
-- migration risk
-- operational criticality
-
-OUTPUT JSON:
-{
-  "recommended_methodology": "Hybrid",
-  "confidence": 90,
-  "reasoning": [],
-  "recommended_practices": [],
-  "governance_model": "",
-  "rollout_strategy": "",
-  "anti_patterns": []
-}
-"""
-
-For each conflict: state signals, decide precedence, issue corrective directive.
-If no conflicts: NO CONFLICTS DETECTED
-Concise. Authoritative."""
-
+from __future__ import annotations
+
+import os
+import re
+import time
+import logging
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Optional
+from enum import Enum
+
+import anthropic
+
+# ── Optional internal module imports (graceful if missing) ─────────────────────
+try:
+    from lifecycle_engine import LifecycleAdvisor
+    _LIFECYCLE_AVAILABLE = True
+except ImportError:
+    _LIFECYCLE_AVAILABLE = False
+
+try:
+    from reasoning import PMReasoningEngine
+    _REASONING_AVAILABLE = True
+except ImportError:
+    _REASONING_AVAILABLE = False
+
+try:
+    from memory import OperationalMemory
+    _MEMORY_AVAILABLE = True
+except ImportError:
+    _MEMORY_AVAILABLE = False
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("agents")
+
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+MODEL = "claude-sonnet-4-6"      # Sonnet: best quality/speed balance for Phase 1
+MAX_TOKENS = 2048
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF = [2, 5, 10]       # seconds between retries
+
+
+# ── Enums ──────────────────────────────────────────────────────────────────────
+class DeliveryMethodology(str, Enum):
+    AGILE      = "Agile"
+    WATERFALL  = "Waterfall"
+    HYBRID     = "Hybrid"
+    PRINCE2    = "PRINCE2"
+    SAFe       = "SAFe"
+    ITERATIVE  = "Iterative"
+    PREDICTIVE = "Predictive / Waterfall"
+    UNKNOWN    = "Undetermined"
+
+
+class GoNoGoDecision(str, Enum):
+    GO               = "GO"
+    NO_GO            = "NO-GO"
+    CONDITIONAL_GO   = "CONDITIONAL GO"
+    INSUFFICIENT     = "INSUFFICIENT DATA"
+
+
+# ── Data Contracts ─────────────────────────────────────────────────────────────
+@dataclass
+class ProjectContext:
+    """
+    Shared context object threaded through every agent.
+    Extend in Phase 2 with: conversation_history, vector_context, agent_memory.
+    """
+    raw_input:    str
+    source_type:  str = "text"       # 'text' | 'file'
+    filename:     Optional[str] = None
+    project_name: Optional[str] = None   # populated by ProjectSummaryAgent
+
+
+@dataclass
+class AgentResult:
+    """Standardised envelope returned by every agent."""
+    agent_name:  str
+    reasoning:   str
+    output:      Any                 # str | dict — agent-specific
+    confidence:  str = "medium"      # low | medium | high
+    warnings:    list[str] = field(default_factory=list)
+    elapsed_ms:  float = 0.0
+    error:       Optional[str] = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None
+
+
+@dataclass
+class PipelineReport:
+    """
+    Full aggregated output from one pipeline run.
+    Stored in OperationalMemory when available.
+    """
+    project_summary:   AgentResult
+    methodology:       AgentResult
+    go_no_go:          AgentResult
+    site_readiness:    AgentResult
+    executive_summary: AgentResult
+    total_elapsed_ms:  float = 0.0
+    run_timestamp:     str = ""
+
+
+# ── Base Agent ─────────────────────────────────────────────────────────────────
+class BaseAgent:
+    """
+    Abstract base for all Phase 1 agents.
+
+    Subclasses must implement:
+        _system_prompt(self) -> str
+        _user_prompt(self, ctx: ProjectContext) -> str
+
+    Subclasses may override:
+        _parse_output(self, raw: str) -> Any
+        reason(self, ctx: ProjectContext) -> str
+    """
+
+    name: str = "BaseAgent"
+
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise EnvironmentError(
+                "ANTHROPIC_API_KEY is not set. "
+                "Export it in your shell: export ANTHROPIC_API_KEY='sk-ant-...'"
+            )
+        self._client = anthropic.Anthropic(api_key=api_key)
+
+    # ── Abstract interface ────────────────────────────────────────────────────
+
+    def _system_prompt(self) -> str:
+        raise NotImplementedError(f"{self.name} must implement _system_prompt()")
+
+    def _user_prompt(self, ctx: ProjectContext) -> str:
+        raise NotImplementedError(f"{self.name} must implement _user_prompt()")
+
+    def _parse_output(self, raw: str) -> Any:
+        """Default: return stripped text. Override for structured extraction."""
+        return raw.strip()
+
+    # ── Reasoning hook (Phase 2: override for chain-of-thought introspection) ─
+
+    def reason(self, ctx: ProjectContext) -> str:
+        """
+        Pre-flight reasoning: why is this agent relevant to this input?
+        Phase 2: replace with LLM-driven chain-of-thought.
+        """
+        chars = len(ctx.raw_input)
+        src   = ctx.source_type
+        name  = ctx.project_name or "unnamed project"
+        return (
+            f"[{self.name}] Analysing {chars:,} chars from {src} "
+            f"for project '{name}'."
+        )
+
+    # ── LLM caller with retry ─────────────────────────────────────────────────
+
+    def _call_llm(self, system: str, user: str) -> str:
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                response = self._client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=system,
+                    messages=[{"role": "user", "content": user}],
+                )
+                return response.content[0].text
+            except anthropic.RateLimitError:
+                wait = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
+                logger.warning(
+                    f"[{self.name}] Rate limit (attempt {attempt}/{RETRY_ATTEMPTS}). "
+                    f"Waiting {wait}s..."
+                )
+                time.sleep(wait)
+            except anthropic.APIStatusError as exc:
+                logger.error(f"[{self.name}] API error: {exc}")
+                raise
+        raise RuntimeError(
+            f"[{self.name}] All {RETRY_ATTEMPTS} LLM call attempts failed."
+        )
+
+    # ── Public run interface ──────────────────────────────────────────────────
+
+    def run(self, ctx: ProjectContext) -> AgentResult:
+        t0        = time.time()
+        reasoning = self.reason(ctx)
+        logger.info(reasoning)
+
+        try:
+            raw    = self._call_llm(self._system_prompt(), self._user_prompt(ctx))
+            output = self._parse_output(raw)
+            error  = None
+        except Exception as exc:
+            logger.error(f"[{self.name}] Failed: {exc}")
+            output = None
+            error  = str(exc)
+
+        elapsed = round((time.time() - t0) * 1000, 2)
+        return AgentResult(
+            agent_name=self.name,
+            reasoning=reasoning,
+            output=output,
+            elapsed_ms=elapsed,
+            error=error,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT 1 — Project Summary
+# ══════════════════════════════════════════════════════════════════════════════
+class ProjectSummaryAgent(BaseAgent):
+    """
+    Reads raw project text and produces a structured project brief.
+    Populates ctx.project_name for downstream agents.
+    """
+    name = "ProjectSummaryAgent"
+
+    def _system_prompt(self) -> str:
+        return (
+            "You are a Senior Business Analyst and Project Strategist with 20 years of "
+            "cross-sector programme delivery experience. "
+            "Your role: read any project document — no matter how raw or unstructured — "
+            "and extract a precise, structured project brief. "
+            "Rules: Be factual. State 'Not specified' for missing information. "
+            "NEVER fabricate figures, names, or dates. "
+            "NEVER pad with generic filler text."
+        )
+
+    def _user_prompt(self, ctx: ProjectContext) -> str:
+        return f"""
+Analyse the following project input and return a structured project brief.
+Use EXACTLY this format. Do not add extra sections.
+
+**PROJECT BRIEF**
+
+**Project Name:** (inferred or stated; use 'Unnamed Project' if absent)
+**Sector / Domain:** (e.g. IT, Infrastructure, Construction, Services)
+**Objectives:**
+- (bullet list, max 5, each one sentence)
+
+**Key Stakeholders:** (roles / departments / individuals mentioned or clearly inferable)
+**Scope Summary:** (2–3 sentences, factual, no padding)
+**Stated Constraints:**
+- Budget: (figure or 'Not specified')
+- Timeline: (duration or end date or 'Not specified')
+- Resources: (headcount, teams, or 'Not specified')
+
+**Timeline Signals:** (any dates, phases, milestones mentioned; or 'None found')
+**Key Risks Identified:**
+- (bullet list, max 5; or 'None explicitly stated')
+
+**Missing Critical Information:** (what's absent that a PM would need before planning)
+
+---
+PROJECT INPUT:
+{ctx.raw_input}
+""".strip()
+
+    def _parse_output(self, raw: str) -> dict:
+        # Extract project name for context propagation
+        name_match = re.search(r"\*\*Project Name:\*\*\s*(.+)", raw)
+        project_name = name_match.group(1).strip() if name_match else "Unnamed Project"
+        return {
+            "project_name": project_name,
+            "full_brief":   raw.strip(),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT 2 — Delivery Methodology
+# ══════════════════════════════════════════════════════════════════════════════
+class MethodologyAgent(BaseAgent):
+    """
+    Recommends a delivery methodology.
+    Optionally enriched by LifecycleAdvisor signal scoring.
+    """
+    name = "MethodologyAgent"
+
+    def __init__(self, api_key: str):
+        super().__init__(api_key)
+        self._lifecycle = LifecycleAdvisor() if _LIFECYCLE_AVAILABLE else None
+
+    def _system_prompt(self) -> str:
+        return (
+            "You are a delivery methodology expert with deep knowledge of Agile, "
+            "Waterfall, Hybrid, PRINCE2, SAFe, Iterative, and Predictive frameworks. "
+            "You recommend the most suitable methodology by reasoning step by step "
+            "across: requirements certainty, compliance intensity, team scale, "
+            "stakeholder complexity, and delivery cadence. "
+            "You are decisive — you give ONE primary recommendation. "
+            "You acknowledge trade-offs honestly."
+        )
+
+    def _user_prompt(self, ctx: ProjectContext) -> str:
+        # Enrich with LifecycleAdvisor signals if available
+        lifecycle_hint = ""
+        if self._lifecycle:
+            try:
+                signals = self._extract_signals(ctx.raw_input)
+                advice  = self._lifecycle.recommend(signals)
+                lifecycle_hint = (
+                    f"\n\n[Internal signal scoring suggests: "
+                    f"{advice['methodology']} (confidence {advice['confidence']}%) "
+                    f"— {advice['reason']}. Use this as one input, not the only factor.]"
+                )
+            except Exception:
+                pass
+
+        return f"""
+Based on the project description below, recommend the most suitable delivery methodology.
+{lifecycle_hint}
+
+Think step by step before answering:
+1. What is the level of requirements certainty?
+2. What is the regulatory/compliance burden?
+3. What is the stakeholder and governance complexity?
+4. What is the scale and duration of delivery?
+5. What delivery cadence suits this team and context?
+
+Then return your answer in EXACTLY this format:
+
+**METHODOLOGY RECOMMENDATION**
+
+**Recommended Methodology:** (one of: Agile | Waterfall | Hybrid | PRINCE2 | SAFe | Iterative | Predictive / Waterfall | Undetermined)
+**Confidence:** (Low | Medium | High)
+
+**Step-by-Step Reasoning:**
+1. Requirements certainty: ...
+2. Compliance burden: ...
+3. Stakeholder complexity: ...
+4. Scale and duration: ...
+5. Delivery cadence fit: ...
+
+**Rationale Summary:** (3–5 sentences)
+
+**Why Not Alternatives:**
+- [Alternative 1]: (brief dismissal)
+- [Alternative 2]: (brief dismissal)
+
+**Methodology-Specific Risks:**
+- (2–3 risks of applying this methodology to THIS project)
+
+**Recommended Governance Model:** (brief description)
+
+---
+PROJECT INPUT:
+{ctx.raw_input}
+""".strip()
+
+    def _extract_signals(self, text: str) -> dict:
+        """Heuristic signal extraction for LifecycleAdvisor."""
+        text_lower = text.lower()
+        return {
+            "infra_dependency": 8 if any(
+                w in text_lower for w in ["infrastructure", "network", "server", "data centre", "dc"]
+            ) else 4,
+            "compliance": 8 if any(
+                w in text_lower for w in ["gdpr", "iso", "regulatory", "audit", "compliance", "governance"]
+            ) else 3,
+            "requirement_volatility": 8 if any(
+                w in text_lower for w in ["agile", "iterative", "evolving", "unclear", "tbd", "to be confirmed"]
+            ) else 3,
+            "procurement": 6 if any(
+                w in text_lower for w in ["vendor", "procurement", "tender", "rfp", "contract", "sow"]
+            ) else 2,
+            "innovation": 7 if any(
+                w in text_lower for w in ["ai", "ml", "innovation", "greenfield", "new technology"]
+            ) else 3,
+        }
+
+    def _parse_output(self, raw: str) -> dict:
+        methodology = DeliveryMethodology.UNKNOWN
+        for m in DeliveryMethodology:
+            if m.value.lower() in raw.lower():
+                methodology = m
+                break
+
+        confidence = "Medium"
+        conf_match = re.search(r"\*\*Confidence:\*\*\s*(\w+)", raw, re.IGNORECASE)
+        if conf_match:
+            confidence = conf_match.group(1).strip()
+
+        return {
+            "methodology": methodology.value,
+            "confidence":  confidence,
+            "full_analysis": raw.strip(),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT 3 — Go / No-Go
+# ══════════════════════════════════════════════════════════════════════════════
+class GoNoGoAgent(BaseAgent):
+    """
+    Structured Go/No-Go viability gate.
+    Enriched by PMReasoningEngine blocker detection where available.
+    """
+    name = "GoNoGoAgent"
+
+    def __init__(self, api_key: str):
+        super().__init__(api_key)
+        self._engine = PMReasoningEngine() if _REASONING_AVAILABLE else None
+
+    def _system_prompt(self) -> str:
+        return (
+            "You are a senior Programme Director and Investment Decision Advisor "
+            "with a track record of leading major programme reviews. "
+            "You perform rigorous Go/No-Go assessments. "
+            "You score five dimensions with explicit reasoning for each. "
+            "You are direct and honest — you will recommend NO-GO when evidence warrants it. "
+            "You never hedge a clear signal into vagueness."
+        )
+
+    def _user_prompt(self, ctx: ProjectContext) -> str:
+        # Surface known hard blockers from PMReasoningEngine
+        blocker_hint = ""
+        if self._engine:
+            try:
+                # Map text signals to PMReasoningEngine data format
+                text_lower = ctx.raw_input.lower()
+                check = self._engine.evaluate_migration_readiness({
+                    "wan_ready":   "wan" not in text_lower or "wan ready" in text_lower,
+                    "cab_approved": "cab" not in text_lower or "cab approved" in text_lower,
+                    "uat_signed":  "uat" not in text_lower or "uat signed" in text_lower,
+                })
+                if check["decision"] == "NO-GO" and check["blockers"]:
+                    blocker_hint = (
+                        f"\n\n[Internal blocker scan detected: {', '.join(check['blockers'])}. "
+                        f"Factor these into your assessment.]"
+                    )
+            except Exception:
+                pass
+
+        return f"""
+Perform a Go/No-Go assessment for the project described below.
+{blocker_hint}
+
+Score each dimension 1–5 (1 = critical concern, 5 = no concerns).
+Reason explicitly for each score before assigning it.
+
+**GO / NO-GO ASSESSMENT**
+
+**Dimension Scores:**
+
+| Dimension               | Score (1–5) | Key Reasoning |
+|-------------------------|-------------|---------------|
+| Strategic Fit           |             |               |
+| Financial Viability     |             |               |
+| Delivery Feasibility    |             |               |
+| Risk Exposure           |             |               |
+| Stakeholder Alignment   |             |               |
+
+**Composite Score:** (sum / 25 × 100 = %)
+
+**Overall Decision:** (GO | NO-GO | CONDITIONAL GO | INSUFFICIENT DATA)
+**Decision Rationale:** (3–5 sentences — be direct)
+
+**Conditions (if CONDITIONAL GO):**
+- (list of conditions that MUST be met before proceeding)
+
+**Critical Blockers (if NO-GO):**
+- (explicit blockers preventing delivery)
+
+**Next Recommended Steps:**
+- (bullet list, max 4 actions)
+
+---
+PROJECT INPUT:
+{ctx.raw_input}
+""".strip()
+
+    def _parse_output(self, raw: str) -> dict:
+        decision = GoNoGoDecision.INSUFFICIENT
+        for d in GoNoGoDecision:
+            if d.value.lower() in raw.lower():
+                decision = d
+                break
+
+        # Extract composite score
+        score = None
+        score_match = re.search(r"Composite Score.*?(\d+(?:\.\d+)?)\s*%", raw, re.IGNORECASE)
+        if score_match:
+            try:
+                score = float(score_match.group(1))
+            except ValueError:
+                pass
+
+        return {
+            "decision":      decision.value,
+            "composite_pct": score,
+            "full_analysis": raw.strip(),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT 4 — Site Readiness
+# ══════════════════════════════════════════════════════════════════════════════
+class SiteReadinessAgent(BaseAgent):
+    """
+    Operational and site-level readiness for delivery.
+    Broad definition: 'site' = physical site, digital environment, or operational context.
+    """
+    name = "SiteReadinessAgent"
+
+    def _system_prompt(self) -> str:
+        return (
+            "You are an Infrastructure Delivery Programme Manager and Site Readiness Expert. "
+            "You assess whether a site, environment, or operational context is ready "
+            "for project delivery to commence. "
+            "'Site' is interpreted broadly: physical sites, cloud environments, "
+            "office locations, data centres, or operational setups. "
+            "Where information is absent, you flag it clearly rather than assuming readiness. "
+            "You are methodical and conservative — readiness gaps are risks, not opinions."
+        )
+
+    def _user_prompt(self, ctx: ProjectContext) -> str:
+        return f"""
+Assess the site and operational readiness for the project described below.
+
+Use status flags: ✅ Ready | ⚠️ Partial | ❌ Not Ready | ❓ Unknown
+
+**SITE READINESS ASSESSMENT**
+
+**Readiness Checklist:**
+
+| Domain                              | Status | Evidence / Notes |
+|-------------------------------------|--------|-----------------|
+| Physical / Digital Infrastructure   |        |                 |
+| Resource & Staffing Availability    |        |                 |
+| Access Rights & Permissions         |        |                 |
+| Predecessor Dependencies Closed     |        |                 |
+| Environmental / Regulatory Approvals|        |                 |
+| Tooling & Systems Readiness         |        |                 |
+| Supply Chain / Vendor Readiness     |        |                 |
+| Connectivity & Network Readiness    |        |                 |
+
+**Overall Readiness Score:** (0–100% — be conservative; unknown = not ready)
+**Readiness Narrative:** (3–5 sentences)
+
+**Top Readiness Blockers:**
+- (bullet list, max 3; most critical first)
+
+**Recommended Pre-Delivery Actions:**
+- (bullet list, max 5; prioritised)
+
+**Earliest Realistic Start Date Assessment:** (based on stated or inferable information)
+
+---
+PROJECT INPUT:
+{ctx.raw_input}
+""".strip()
+
+    def _parse_output(self, raw: str) -> dict:
+        score = None
+        score_match = re.search(
+            r"Overall Readiness Score.*?(\d+(?:\.\d+)?)\s*%", raw, re.IGNORECASE
+        )
+        if score_match:
+            try:
+                score = float(score_match.group(1))
+            except ValueError:
+                pass
+
+        return {
+            "readiness_pct": score,
+            "full_analysis": raw.strip(),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT 5 — Executive Summary
+# ══════════════════════════════════════════════════════════════════════════════
+class ExecutiveSummaryAgent(BaseAgent):
+    """
+    Synthesises all prior agent outputs into a C-suite executive summary.
+    Runs LAST after all other agents complete.
+    Receives enriched context via a combined prompt.
+    """
+    name = "ExecutiveSummaryAgent"
+
+    def _system_prompt(self) -> str:
+        return (
+            "You are an executive ghostwriter and Chief of Staff advisor "
+            "to a Programme Director. "
+            "You synthesise complex programme analyses into crisp, board-ready "
+            "executive summaries. "
+            "Rules: No jargon. No padding. No hedging. "
+            "Structured for a 90-second read. "
+            "Every sentence must earn its place. "
+            "Missing data = explicit gap statement, not silence."
+        )
+
+    def _user_prompt(self, ctx: ProjectContext) -> str:
+        # ctx.raw_input for this agent contains the synthesised prior outputs
+        return f"""
+Using the full project analysis below, write a concise Executive Summary
+suitable for a C-suite or Board audience.
+
+Use EXACTLY this structure:
+
+**EXECUTIVE SUMMARY**
+
+**Project at a Glance:**
+(2–3 sentences: what the project is, why it exists, key timeline)
+
+**Delivery Approach:**
+(1–2 sentences: recommended methodology and why)
+
+**Decision:** [GO ✅ | NO-GO ❌ | CONDITIONAL GO ⚠️ | INSUFFICIENT DATA ❓]
+(1–2 sentences explaining the basis for the decision)
+
+**Readiness Status:** [score]%
+(1 sentence on the primary readiness concern, or 'Operationally ready to proceed')
+
+**Top 3 Risks / Concerns:**
+1. ...
+2. ...
+3. ...
+
+**Recommended Immediate Actions:**
+1. (owner — action — due)
+2. (owner — action — due)
+3. (owner — action — due)
+
+**Bottom Line:**
+(One punchy sentence: the single most important thing the board should know)
+
+---
+ANALYSIS INPUT (do not reproduce verbatim — synthesise):
+{ctx.raw_input}
+""".strip()
+
+    def _parse_output(self, raw: str) -> dict:
+        # Extract the decision line for quick display
+        decision_match = re.search(
+            r"\*\*Decision:\*\*\s*\[(.+?)\]", raw, re.IGNORECASE
+        )
+        decision_label = decision_match.group(1).strip() if decision_match else "See report"
+
+        return {
+            "decision_label": decision_label,
+            "full_summary":   raw.strip(),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════════════════
+class AgentOrchestrator:
+    """
+    Orchestrates the Phase 1 pipeline.
+
+    Execution pattern:
+      - Agents 1–4 run in PARALLEL (threads).
+      - Agent 5 (ExecutiveSummary) runs AFTER all others complete,
+        receiving synthesised outputs as its context.
+
+    Phase 2 hooks (not active):
+      - Conversational history: pass conversation_history to ProjectContext
+      - Agent-to-agent messaging: route agent outputs to downstream agents
+      - RAG enrichment: inject vector_context into each agent prompt
+      - Memory persistence: already wired to OperationalMemory below
+
+    Args:
+        api_key: Anthropic API key. Defaults to ANTHROPIC_API_KEY env var.
+    """
+
+    def __init__(self, api_key: Optional[str] = None):
+        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not self._api_key:
+            raise EnvironmentError(
+                "ANTHROPIC_API_KEY not found. "
+                "Set it via: export ANTHROPIC_API_KEY='sk-ant-...'"
+            )
+
+        # Instantiate Phase 1 agents
+        self._summary_agent    = ProjectSummaryAgent(self._api_key)
+        self._method_agent     = MethodologyAgent(self._api_key)
+        self._gonogo_agent     = GoNoGoAgent(self._api_key)
+        self._readiness_agent  = SiteReadinessAgent(self._api_key)
+        self._exec_agent       = ExecutiveSummaryAgent(self._api_key)
+
+        # Memory (optional — graceful if unavailable)
+        self._memory = OperationalMemory() if _MEMORY_AVAILABLE else None
+
+    # ── Public interface ──────────────────────────────────────────────────────
+
+    def run_pipeline(
+        self,
+        raw_text: str,
+        source_type: str = "text",
+        filename: Optional[str] = None,
+        progress_callback=None,  # callable(agent_name, status) for UI updates
+    ) -> PipelineReport:
+        """
+        Execute the full Phase 1 analysis pipeline.
+
+        Args:
+            raw_text:          Project text to analyse.
+            source_type:       'text' or 'file'.
+            filename:          Original filename if source_type is 'file'.
+            progress_callback: Optional UI hook for streaming progress updates.
+
+        Returns:
+            PipelineReport with all agent outputs.
+        """
+        t_pipeline_start = time.time()
+
+        ctx = ProjectContext(
+            raw_input=raw_text,
+            source_type=source_type,
+            filename=filename,
+        )
+
+        # ── Phase A: Agents 1–4 in parallel ──────────────────────────────────
+        results: dict[str, Optional[AgentResult]] = {
+            "summary":   None,
+            "method":    None,
+            "gonogo":    None,
+            "readiness": None,
+        }
+
+        def run_agent(key: str, agent: BaseAgent, agent_ctx: ProjectContext):
+            if progress_callback:
+                progress_callback(agent.name, "running")
+            results[key] = agent.run(agent_ctx)
+            if progress_callback:
+                progress_callback(agent.name, "done")
+
+        threads = [
+            threading.Thread(
+                target=run_agent, args=("summary",   self._summary_agent,   ctx)
+            ),
+            threading.Thread(
+                target=run_agent, args=("method",    self._method_agent,    ctx)
+            ),
+            threading.Thread(
+                target=run_agent, args=("gonogo",    self._gonogo_agent,    ctx)
+            ),
+            threading.Thread(
+                target=run_agent, args=("readiness", self._readiness_agent, ctx)
+            ),
+        ]
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Propagate detected project name
+        if results["summary"] and results["summary"].succeeded:
+            data = results["summary"].output
+            if isinstance(data, dict):
+                ctx.project_name = data.get("project_name")
+
+        # ── Phase B: Executive Summary (sequential, reads all prior outputs) ─
+        if progress_callback:
+            progress_callback(self._exec_agent.name, "running")
+
+        exec_ctx = self._build_exec_context(ctx, results)
+        exec_result = self._exec_agent.run(exec_ctx)
+
+        if progress_callback:
+            progress_callback(self._exec_agent.name, "done")
+
+        # ── Assemble report ───────────────────────────────────────────────────
+        total_ms = round((time.time() - t_pipeline_start) * 1000, 2)
+
+        report = PipelineReport(
+            project_summary=results["summary"]
+                or self._error_result("ProjectSummaryAgent"),
+            methodology=results["method"]
+                or self._error_result("MethodologyAgent"),
+            go_no_go=results["gonogo"]
+                or self._error_result("GoNoGoAgent"),
+            site_readiness=results["readiness"]
+                or self._error_result("SiteReadinessAgent"),
+            executive_summary=exec_result,
+            total_elapsed_ms=total_ms,
+            run_timestamp=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        )
+
+        # ── Persist to memory ─────────────────────────────────────────────────
+        self._persist_to_memory(ctx, report)
+
+        logger.info(
+            f"[Orchestrator] Pipeline complete in {total_ms:.0f}ms "
+            f"for project '{ctx.project_name or 'unnamed'}'."
+        )
+        return report
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _build_exec_context(
+        self,
+        ctx: ProjectContext,
+        results: dict[str, Optional[AgentResult]],
+    ) -> ProjectContext:
+        """
+        Build a synthetic context for the ExecutiveSummaryAgent
+        by concatenating all prior outputs into a single text block.
+        """
+
+        def safe_text(key: str, label: str) -> str:
+            r = results.get(key)
+            if r and r.succeeded and r.output:
+                if isinstance(r.output, dict):
+                    return f"=== {label} ===\n{r.output.get('full_brief') or r.output.get('full_analysis') or str(r.output)}"
+                return f"=== {label} ===\n{r.output}"
+            return f"=== {label} ===\n[AGENT ERROR — output not available]"
+
+        combined = "\n\n".join([
+            f"Original Project Input (excerpt, first 1000 chars):\n{ctx.raw_input[:1000]}",
+            safe_text("summary",   "PROJECT BRIEF"),
+            safe_text("method",    "METHODOLOGY RECOMMENDATION"),
+            safe_text("gonogo",    "GO/NO-GO ASSESSMENT"),
+            safe_text("readiness", "SITE READINESS"),
+        ])
+
+        return ProjectContext(
+            raw_input=combined,
+            source_type="synthesised",
+            project_name=ctx.project_name,
+        )
+
+    def _persist_to_memory(self, ctx: ProjectContext, report: PipelineReport) -> None:
+        """Write key decisions to OperationalMemory if available."""
+        if not self._memory:
+            return
+        try:
+            if report.go_no_go.succeeded and isinstance(report.go_no_go.output, dict):
+                self._memory.add("decisions", {
+                    "project":   ctx.project_name,
+                    "decision":  report.go_no_go.output.get("decision"),
+                    "timestamp": report.run_timestamp,
+                })
+            if report.methodology.succeeded and isinstance(report.methodology.output, dict):
+                self._memory.add("lifecycle_recommendations", {
+                    "project":     ctx.project_name,
+                    "methodology": report.methodology.output.get("methodology"),
+                    "confidence":  report.methodology.output.get("confidence"),
+                })
+            if report.site_readiness.succeeded and isinstance(report.site_readiness.output, dict):
+                pct = report.site_readiness.output.get("readiness_pct")
+                if pct is not None:
+                    self._memory.add("cutover_readiness", {
+                        "project": ctx.project_name,
+                        "score":   pct,
+                    })
+        except Exception as exc:
+            logger.warning(f"[Orchestrator] Memory persist failed: {exc}")
+
+    @staticmethod
+    def _error_result(agent_name: str) -> AgentResult:
+        return AgentResult(
+            agent_name=agent_name,
+            reasoning="Agent did not complete.",
+            output=None,
+            error="No result returned from thread.",
+        )
+
+
+# ── Module-level convenience ───────────────────────────────────────────────────
+def get_orchestrator(api_key: Optional[str] = None) -> AgentOrchestrator:
+    """Factory function — use in app.py to obtain a cached orchestrator."""
+    return AgentOrchestrator(api_key=api_key)
