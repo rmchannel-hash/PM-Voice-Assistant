@@ -1,940 +1,874 @@
 """
-app.py — Phase 1 Stabilized
-=============================
-PMO Intelligence Platform — Multi-Tab Streamlit UI
-Provider  : Anthropic Claude (via agents.py)
-Phase     : 1 — Core Analysis Pipeline
+Multi-Agent PMO Command Center
+==============================
+Project-agnostic. Works on any project — paste any SOW, Bid Doc, or Status Report.
+Multiple projects supported — each fully isolated with its own RAG stores.
+Human-in-the-loop gating at every pipeline stage.
 
-Tabs:
-  1. 📥 Input         — paste text or upload file
-  2. 📊 Analysis      — structured project brief
-  3. 🔄 Methodology   — delivery methodology recommendation
-  4. ✅ Go/No-Go      — viability gate with scoring
-  5. 🏗 Site Readiness — operational readiness assessment
-  6. 📋 Executive Summary — board-ready synthesis
-
-Architecture:
-  - All AI work is in agents.py (never inline in UI).
-  - UI layer is purely display + state management.
-  - session_state is the single source of truth.
-  - Progress callbacks bridge agent threads → UI feedback.
-
-Phase 2 hooks (not active but wired):
-  - Conversational AI: st.chat_input ready in sidebar
-  - Multi-project support: project registry scaffold in session_state
-  - Voice: launch point noted in Input tab
+Setup:
+  .streamlit/secrets.toml  →  GEMINI_API_KEY = "your-key"
 """
-
-import os
-import io
-import time
-import threading
-import logging
-from datetime import datetime
-from typing import Optional
+from memory import OperationalMemory
+from dependency_graph import DependencyGraph
+from lifecycle_engine import LifecycleAdvisor
+from reasoning import PMReasoningEngine
+from vector_store import PMOVectorStore
 
 import streamlit as st
+import google.generativeai as genai
+import json
+import re
+import threading
+import time
+from datetime import datetime
 
-# ── Internal modules ───────────────────────────────────────────────────────────
-# agents.py is the only required import; others are gracefully optional
-from agents import (
-    AgentOrchestrator,
-    ProjectContext,
-    PipelineReport,
-    AgentResult,
-)
+st.set_page_config(page_title="PMO Command Center", page_icon="⚓", layout="wide")
 
-# ── Optional supporting modules (Phase 2 will use these fully) ─────────────────
+# ── API KEY ──────────────────────────────────────────────────────
 try:
-    from memory import OperationalMemory
-    _MEMORY_AVAILABLE = True
-except ImportError:
-    _MEMORY_AVAILABLE = False
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+except Exception:
+    st.error("GEMINI_API_KEY missing. Add to .streamlit/secrets.toml")
+    st.stop()
 
-try:
-    from dependency_graph import DependencyGraph
-    _DEPGRAPH_AVAILABLE = True
-except ImportError:
-    _DEPGRAPH_AVAILABLE = False
+# ════════════════════════════════════════════════════════════════
+#  PROJECT-AGNOSTIC PROMPTS
+# ════════════════════════════════════════════════════════════════
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
+ORCHESTRATOR_PROMPT = """You are Captain Sinbad Sailor — a hyper-structured Programme Director specialising in EVM, risk governance, and multi-domain project delivery.
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PAGE CONFIG  (must be first Streamlit call)
-# ══════════════════════════════════════════════════════════════════════════════
+You are FULLY PROJECT-AGNOSTIC. You work on any project in any sector — infrastructure, IT, construction, consulting, manufacturing, services. Analyse whatever document is given on its own terms.
 
-st.set_page_config(
-    page_title="PMO Intelligence Platform",
-    page_icon="🧭",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+STEP 1 — IDENTIFY:
+Extract: project name, client, vendor, contract value + currency, duration, current period/status, scope summary. Note any gaps but continue.
 
+STEP 2 — INGEST:
+Strip filler language. Identify hard contractual requirements, scope boundaries, milestones, financial and schedule baselines.
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CUSTOM CSS
-# ══════════════════════════════════════════════════════════════════════════════
+STEP 3 — DATA SEPARATION (MANDATORY):
+Source RAG Store = original documents, READ-ONLY. Agent Output Store = agent outputs only. Never mix.
 
-st.markdown("""
-<style>
-/* ── Typography & base ─────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+STEP 4 — DELEGATE CONCURRENTLY to three agents:
+- PM & CONTROLS AGENT: all financial figures, EVM data, schedules, resources, milestone dates
+- TECHNICAL & RISK GOVERNANCE AGENT: technical constraints, dependencies, infra/regulatory blockers, assumptions
+- STAKEHOLDER COMMUNICATION ADVISOR: all named people, client contacts, correspondence references, sign-off authorities
 
-html, body, [class*="css"] {
-    font-family: 'IBM Plex Sans', sans-serif;
-}
+STEP 5 — FLAG CONFLICTS: Note any structural conflicts between data elements (e.g. timeline vs resource availability).
 
-/* ── Status badge components ────────────────────────────────────── */
-.badge-go        { background:#1a7a4a; color:#fff; padding:2px 10px; border-radius:4px; font-weight:600; font-size:13px; }
-.badge-nogo      { background:#b91c1c; color:#fff; padding:2px 10px; border-radius:4px; font-weight:600; font-size:13px; }
-.badge-cond      { background:#92400e; color:#fff; padding:2px 10px; border-radius:4px; font-weight:600; font-size:13px; }
-.badge-insuff    { background:#374151; color:#fff; padding:2px 10px; border-radius:4px; font-weight:600; font-size:13px; }
+STEP 6 — ESCALATE: SPI < 0.95, CPI < 0.95, or any risk ≥20 on 5x5 P×I → Director Escalation with named owner.
 
-/* ── Metric card ─────────────────────────────────────────────────── */
-.metric-card {
-    background: var(--background-color, #1e2130);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 8px;
-    padding: 16px 20px;
-    margin-bottom: 8px;
-}
-.metric-label { font-size: 11px; font-weight: 500; text-transform: uppercase;
-                letter-spacing: 0.08em; opacity: 0.6; margin-bottom: 4px; }
-.metric-value { font-size: 26px; font-weight: 600; font-family: 'IBM Plex Mono', monospace; }
-.metric-sub   { font-size: 12px; opacity: 0.55; margin-top: 4px; }
+REVISION: If REVISION REQUEST is included, address each point explicitly first.
 
-/* ── Agent status pills ─────────────────────────────────────────── */
-.agent-pill-running { color:#f59e0b; font-size:12px; }
-.agent-pill-done    { color:#10b981; font-size:12px; }
-.agent-pill-error   { color:#ef4444; font-size:12px; }
+NEVER return NULL_STATE for an unfamiliar project. Analyse what is given. NULL_STATE only if input is empty or unreadable.
 
-/* ── Section header ─────────────────────────────────────────────── */
-.section-header {
-    border-left: 3px solid #3b82f6;
-    padding-left: 12px;
-    margin: 20px 0 12px;
-    font-weight: 600;
-    font-size: 15px;
-    letter-spacing: 0.02em;
-}
+OUTPUT:
+## Project Identified
+[Name | Client | Vendor | Contract Value + Currency | Duration | Current Period]
 
-/* ── Tab content padding ────────────────────────────────────────── */
-.stTabs [data-baseweb="tab-panel"] {
-    padding-top: 20px;
-}
+## Data Routing
+[Exactly what goes to each agent from this document]
 
-/* ── Readiness score bar ────────────────────────────────────────── */
-.readiness-bar-wrap { background: rgba(255,255,255,0.07); border-radius: 6px;
-                      height: 10px; margin: 8px 0; overflow: hidden; }
-.readiness-bar-fill { height: 100%; border-radius: 6px;
-                      background: linear-gradient(90deg, #f59e0b, #10b981); }
-</style>
-""", unsafe_allow_html=True)
+## Critical Path Assessment
+[3-5 sentences based on this document]
 
+## Director Escalations
+[Named escalations or: NONE]
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SESSION STATE INITIALISATION
-# ══════════════════════════════════════════════════════════════════════════════
+## Conflict Flags
+[Detected conflicts or: NONE DETECTED]"""
 
-def _init_state() -> None:
-    defaults = {
-        # Core analysis state
-        "report":            None,        # PipelineReport | None
-        "is_running":        False,       # lock while pipeline executes
-        "run_timestamp":     None,        # datetime of last run
-        "project_text":      "",          # last analysed text
-        "source_filename":   None,        # if uploaded file
+PM_PROMPT = """You are the Lead Project Controller — EVM specialist (ANSI/EIA-748) and WBS methodology expert.
 
-        # Agent progress tracking (for live UI feedback)
-        "agent_progress": {
-            "ProjectSummaryAgent":    "idle",
-            "MethodologyAgent":       "idle",
-            "GoNoGoAgent":            "idle",
-            "SiteReadinessAgent":     "idle",
-            "ExecutiveSummaryAgent":  "idle",
-        },
+You are PROJECT-AGNOSTIC. Work on whatever project document and director directive are provided.
 
-        # Phase 2 scaffold: conversational history
-        "conversation_history": [],
+INSTRUCTIONS:
+1. Extract project name, contract value (BAC), currency, timeline, period from the document.
+2. Build Level 2 WBS from deliverables/workstreams/packages in the document. Use document's own terminology for package names.
+3. EVM: If actuals exist — SPI=EV/PV | CPI=EV/AC | CV=EV-AC | SV=EV-PV | EAC=BAC/CPI | TCPI=(BAC-EV)/(BAC-AC). Flag breach if SPI<0.95 or CPI<0.95.
+   If actuals missing — set ev/ac/pv to 0 and list gap. Never fabricate numbers.
+4. Flag resource over-allocation or under-deployment if mentioned.
+5. Address REVISION REQUEST points explicitly if present.
 
-        # Phase 2 scaffold: project registry
-        "project_registry": {},
-
-        # Active tab tracking
-        "active_tab": 0,
+OUTPUT: Return ONLY valid JSON — no prose, no markdown fences, no backticks:
+{
+  "agent": "PM_CONTROLS",
+  "project_name": "from document",
+  "currency": "e.g. INR or USD or AUD",
+  "period": "e.g. M7 or Q2 or Week 12",
+  "report_timestamp": "ISO8601",
+  "evm_summary": {
+    "bac": 0.0, "pv": 0.0, "ev": 0.0, "ac": 0.0,
+    "spi": 0.0, "cpi": 0.0, "sv": 0.0, "cv": 0.0,
+    "eac": 0.0, "tcpi": 0.0,
+    "recovery_feasible": true, "governance_breach": false
+  },
+  "wbs_packages": [
+    {
+      "id": "1.1", "name": "Package name from document",
+      "budget": 0.0, "spent": 0.0, "pct_complete": 0,
+      "status": "GREEN", "resource_flag": null
     }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+  ],
+  "data_gaps": [],
+  "escalations": []
+}"""
 
+RISK_PROMPT = """You are the Technical PMO Lead and Risk Governance Agent — ISO 31000 standards. You are PROJECT-AGNOSTIC.
 
-_init_state()
+INSTRUCTIONS:
+1. Extract all technical risks, dependencies, constraints, site issues, regulatory blockers, and assumptions from the document.
+2. RAID register: for each item assign ONE named owner (individual from document — if unknown use UNASSIGNED), target closure date, P(1-5) x I(1-5) = exposure score, severity (>=20 CRITICAL, 10-19 HIGH, 5-9 MEDIUM, <5 LOW). Director escalation if score >=20.
+3. RACI matrix from document roles — ONE Accountable per WBS package, no exceptions.
+4. Address REVISION REQUEST points if present.
 
+OUTPUT: Return ONLY valid JSON — no prose, no markdown fences:
+{
+  "agent": "TECHNICAL_RISK",
+  "project_name": "from document",
+  "period": "from document",
+  "raid_items": [
+    {
+      "id": "R-001", "type": "RISK",
+      "description": "specific risk from document",
+      "probability": 3, "impact": 4, "exposure_score": 12,
+      "severity": "HIGH",
+      "owner": "name from document",
+      "target_closure": "date or week",
+      "status": "OPEN",
+      "director_escalation": false
+    }
+  ],
+  "raci_matrix": [
+    {
+      "wbs_id": "1.1", "wbs_name": "Package name",
+      "roles": {"role_name": "A", "role_name_2": "R"}
+    }
+  ],
+  "governance_gaps": [],
+  "escalations": []
+}"""
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  API KEY RESOLUTION
-# ══════════════════════════════════════════════════════════════════════════════
+COGNITIVE_PROMPT = """You are the Stakeholder Communication Advisor — transparent engagement only. No manipulation. You are PROJECT-AGNOSTIC.
 
-def _resolve_api_key() -> Optional[str]:
-    """Priority: env var → streamlit secrets → sidebar input."""
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if key:
-        return key
-    try:
-        key = st.secrets.get("ANTHROPIC_API_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
-    return st.session_state.get("_sidebar_api_key", "")
+INSTRUCTIONS:
+1. Extract all named stakeholders, client contacts, sign-off authorities from the document.
+2. Engagement Score (0-100): based on recency/substance of contact references in the document. Flag OVERDUE if >7 days no contact.
+3. For each stakeholder: stated concerns, inferable concerns, outstanding commitments.
+4. Recommended engagement: transparent, professional advice only. No psychological scripts.
+5. Identify what could delay acceptance milestones (UAT, sign-off, commissioning).
+6. Address REVISION REQUEST if present. If no stakeholders named, return one entry noting the gap.
 
+OUTPUT: Return ONLY valid JSON — no prose, no markdown fences:
+{
+  "agent": "STAKEHOLDER_ADVISOR",
+  "project_name": "from document",
+  "period": "from document",
+  "stakeholders": [
+    {
+      "name": "Full name", "role": "role",
+      "authority": "what they sign off",
+      "engagement_score": 50, "status": "AMBER",
+      "last_contact_days": 0, "overdue_flag": false,
+      "stated_concerns": [],
+      "inferable_concerns": [],
+      "outstanding_commitments": [],
+      "recommended_engagement": "specific transparent advice"
+    }
+  ],
+  "uat_handshake_gaps": [],
+  "immediate_attention_required": [],
+  "data_gaps": []
+}"""
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PIPELINE RUNNER  (called in background thread)
-# ══════════════════════════════════════════════════════════════════════════════
+REPORTING_PROMPT = """You are the Executive Communications Specialist — project-agnostic. Convert structured agent data into boardroom-ready briefs.
 
-def _progress_cb(agent_name: str, status: str) -> None:
-    """Thread-safe progress update hook."""
-    if "agent_progress" in st.session_state:
-        st.session_state["agent_progress"][agent_name] = status
+INSTRUCTIONS:
+1. Use ONLY the agent outputs provided. Do not invent data. Missing = explicit gap in brief.
+2. Address REVISION REQUEST points if present.
+3. Produce:
 
+A. DAILY PROGRESS BRIEF
+Project: [name] | Period: [period] | Date: [today]
+- Completions this period
+- Critical blockers (top 3)
+- Next critical path actions
+- RAG status per workstream
 
-def _run_pipeline(
-    text: str,
-    api_key: str,
-    source_type: str = "text",
-    filename: Optional[str] = None,
-) -> None:
-    """Execute the full agent pipeline and store report in session_state."""
-    st.session_state["is_running"] = True
-    st.session_state["report"]     = None
+B. WEEKLY STEERCO DECK
+- Executive summary (3-4 sentences)
+- Overall RAG status table
+- EVM table: BAC | PV | EV | AC | SPI | CPI | EAC | TCPI | Currency
+- Top 3 RAID items with owner and target
+- Stakeholder engagement table
+- Priority actions: action | owner | due | priority
 
-    # Reset agent progress
-    for name in st.session_state["agent_progress"]:
-        st.session_state["agent_progress"][name] = "idle"
+MANDATORY FINAL LINE (exactly):
+STATUS: PENDING PM DIRECTOR APPROVAL — DO NOT DISTRIBUTE
 
-    try:
-        orchestrator = AgentOrchestrator(api_key=api_key)
-        report = orchestrator.run_pipeline(
-            raw_text=text,
-            source_type=source_type,
-            filename=filename,
-            progress_callback=_progress_cb,
+OUTPUT FORMAT: Structured markdown with tables."""
+
+ARBITRATION_PROMPT = """You are Captain Sinbad Sailor. Arbitrate conflicts between three agent outputs. Project-agnostic.
+
+CHECK:
+1. PM says recovery feasible but Risk has unresolved CRITICAL blocker → conflict
+2. Cost overrun but client unaware → communication gap
+3. Risk owner vs RACI accountability mismatch → governance conflict
+4. Escalation in one agent not reflected in others
+
+For each conflict: state the signals, decide precedence, issue corrective directive.
+Address REVISION REQUEST if present.
+If no conflicts: NO CONFLICTS DETECTED
+
+Concise. Authoritative."""
+
+# ════════════════════════════════════════════════════════════════
+#  DATA LAYER
+# ════════════════════════════════════════════════════════════════
+
+class DualRAGStore:
+    def __init__(self, project_name):
+        self.project_name = project_name
+        self.source_store = {}
+        self.agent_output_store = {}
+        self.audit_log = []
+
+    def ingest_source(self, content, label="document"):
+        doc_id = f"SRC_{datetime.utcnow().strftime('%H%M%S')}"
+        self.source_store[doc_id] = {
+            "label": label, "content": content,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self._log(f"SOURCE: {doc_id} ({label})")
+        return doc_id
+
+    def write_agent_output(self, agent_id, output):
+        self.agent_output_store[agent_id] = {
+            "data": output, "timestamp": datetime.utcnow().isoformat()
+        }
+        self._log(f"AGENT: {agent_id}")
+
+    def read_agent_output(self, agent_id):
+        return self.agent_output_store.get(agent_id, {}).get("data")
+
+    def get_all_source_text(self):
+        return "\n\n---\n\n".join(
+            f"[{v['label']}]\n{v['content']}"
+            for v in self.source_store.values()
         )
-        st.session_state["report"]        = report
-        st.session_state["project_text"]  = text
-        st.session_state["source_filename"] = filename
-        st.session_state["run_timestamp"] = datetime.now()
-    except Exception as exc:
-        logger.error(f"Pipeline failed: {exc}")
-        st.session_state["_pipeline_error"] = str(exc)
-    finally:
-        st.session_state["is_running"] = False
+
+    def _log(self, msg):
+        self.audit_log.append(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  HELPER RENDER FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
+class ProjectWorkspace:
+    def __init__(self, name, created):
+        self.name = name
+        self.created = created
+        self.rag = DualRAGStore(name)
+        self.stage = 0
+        self.orchestrator_out = None
+        self.pm_out = None
+        self.risk_out = None
+        self.cog_out = None
+        self.arbitration_out = None
+        self.report_out = None
+        self.raw_pm = self.raw_risk = self.raw_cog = ""
+        self.gates = {1: "pending", 2: "pending", 3: "pending", 4: "pending"}
+        self.notes = {1: "", 2: "", 3: "", 4: ""}
+        self.revisions = {1: 0, 2: 0, 3: 0, 4: 0}
+        self.detected_name = ""
+        self.detected_client = ""
 
-def _render_agent_error(result: AgentResult) -> None:
-    st.error(
-        f"**{result.agent_name}** encountered an error: `{result.error}`\n\n"
-        "Check your API key and network connection, then re-run."
-    )
+# ════════════════════════════════════════════════════════════════
+#  UTILITIES
+# ════════════════════════════════════════════════════════════════
 
+def safe_parse_json(raw, fallback):
+    if not raw or any(raw.startswith(x) for x in ["ERROR", "QUOTA"]):
+        return {**fallback, "data_gaps": [raw or "Empty agent response"]}
+    clean = raw.strip()
+    if "```" in clean:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", clean)
+        clean = m.group(1).strip() if m else clean.replace("```", "").strip()
+    s, e = clean.find("{"), clean.rfind("}")
+    if s != -1 and e > s:
+        clean = clean[s:e+1]
+    try:
+        return json.loads(clean)
+    except Exception:
+        return {**fallback, "data_gaps": [f"JSON parse failed. Raw preview: {raw[:150]}"]}
 
-def _render_elapsed(result: AgentResult) -> None:
-    st.caption(f"⏱ {result.elapsed_ms:,.0f} ms · {result.agent_name}")
+def safe_num(v, d=0.0):
+    try:
+        return float(v) if v is not None else d
+    except (TypeError, ValueError):
+        return d
 
+def safe_pct(v):
+    try:
+        return max(0, min(100, int(float(v or 0))))
+    except (TypeError, ValueError):
+        return 0
 
-def _go_badge(decision: str) -> str:
-    d = decision.upper()
-    if "NO-GO" in d:
-        return '<span class="badge-nogo">NO-GO ❌</span>'
-    if "CONDITIONAL" in d:
-        return '<span class="badge-cond">CONDITIONAL GO ⚠️</span>'
-    if "INSUFFICIENT" in d:
-        return '<span class="badge-insuff">INSUFFICIENT DATA ❓</span>'
-    return '<span class="badge-go">GO ✅</span>'
+def pm_fallback(name=""):
+    return {
+        "agent": "PM_CONTROLS", "project_name": name,
+        "currency": "", "period": "M1",
+        "report_timestamp": datetime.utcnow().isoformat(),
+        "evm_summary": {
+            "bac": 0.0, "pv": 0.0, "ev": 0.0, "ac": 0.0,
+            "spi": 0.0, "cpi": 0.0, "sv": 0.0, "cv": 0.0,
+            "eac": 0.0, "tcpi": 0.0,
+            "recovery_feasible": True, "governance_breach": False
+        },
+        "wbs_packages": [],
+        "data_gaps": ["Could not parse agent output — check Debug tab."],
+        "escalations": []
+    }
 
+def risk_fallback(name=""):
+    return {
+        "agent": "TECHNICAL_RISK", "project_name": name, "period": "M1",
+        "raid_items": [], "raci_matrix": [],
+        "governance_gaps": ["Could not parse agent output — check Debug tab."],
+        "escalations": []
+    }
 
-def _readiness_bar(pct: Optional[float]) -> str:
-    if pct is None:
-        return ""
-    colour = "#ef4444" if pct < 50 else "#f59e0b" if pct < 75 else "#10b981"
-    return (
-        f'<div class="readiness-bar-wrap">'
-        f'<div class="readiness-bar-fill" style="width:{pct:.0f}%; background:{colour};"></div>'
-        f'</div>'
-    )
+def cog_fallback(name=""):
+    return {
+        "agent": "STAKEHOLDER_ADVISOR", "project_name": name, "period": "M1",
+        "stakeholders": [], "uat_handshake_gaps": [],
+        "immediate_attention_required": [],
+        "data_gaps": ["Could not parse agent output — check Debug tab."]
+    }
 
+# ════════════════════════════════════════════════════════════════
+#  GEMINI CALLER
+# ════════════════════════════════════════════════════════════════
 
-def _metric_card(label: str, value: str, sub: str = "") -> str:
-    return (
-        f'<div class="metric-card">'
-        f'<div class="metric-label">{label}</div>'
-        f'<div class="metric-value">{value}</div>'
-        f'{"<div class=metric-sub>" + sub + "</div>" if sub else ""}'
-        f'</div>'
-    )
+def call_gemini(system_prompt, user_msg, model="gemini-2.5-flash"):
+    backoff = [15, 30, 60, 90]
+    for attempt in range(5):
+        try:
+            m = genai.GenerativeModel(model_name=model,
+                                       system_instruction=system_prompt)
+            return m.generate_content(user_msg).text
+        except Exception as e:
+            err = str(e)
+            if any(x in err for x in ["429", "quota", "rate"]):
+                if attempt < 4:
+                    wait = backoff[attempt]
+                    dm = re.search(r"(\d+(?:\.\d+)?)\s*s", err)
+                    if dm:
+                        wait = min(int(float(dm.group(1))) + 5, 120)
+                    st.toast(f"Rate limit — waiting {wait}s (retry {attempt+1}/4)", icon="⏳")
+                    time.sleep(wait)
+                    continue
+                return (f"QUOTA_EXCEEDED: Enable billing at https://aistudio.google.com "
+                        f"(costs < ₹5 for a demo)\n\nError: {err}")
+            return f"ERROR: {err}"
+    return "ERROR: Max retries exceeded."
 
+def call_parallel(payloads):
+    results = [None] * len(payloads)
+    def worker(i, sp, um, mn):
+        results[i] = call_gemini(sp, um, mn)
+    threads = [threading.Thread(target=worker, args=(i, sp, um, mn))
+               for i, (sp, um, mn) in enumerate(payloads)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    return results
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
+#  PIPELINE RUNNERS
+# ════════════════════════════════════════════════════════════════
+
+def run_orchestrator(ws, revision=""):
+    src = ws.rag.get_all_source_text()
+    msg = f"REVISION REQUEST:\n{revision}\n\n---\nSOURCE:\n{src}" if revision else src
+    with st.spinner("🎖 Captain Sinbad — analysing document..."):
+        ws.orchestrator_out = call_gemini(ORCHESTRATOR_PROMPT, msg)
+    ws.gates[1] = "pending"
+    ws.stage = 1
+
+def run_agents(ws, revision=""):
+    src = ws.rag.get_all_source_text()
+    d = ws.orchestrator_out or ""
+    def pay(label):
+        base = f"DIRECTOR DIRECTIVE:\n{d}\n\nROUTE: {label}\n\nSOURCE:\n{src}"
+        return f"REVISION REQUEST:\n{revision}\n\n---\n{base}" if revision else base
+    with st.spinner("📊 🛡 🧠  Running 3 agents in parallel..."):
+        r = call_parallel([
+            (PM_PROMPT,        pay("PM_CONTROLS"),    "gemini-2.5-flash"),
+            (RISK_PROMPT,      pay("TECHNICAL_RISK"), "gemini-2.5-flash"),
+            (COGNITIVE_PROMPT, pay("STAKEHOLDER"),    "gemini-2.5-flash"),
+        ])
+    ws.raw_pm, ws.raw_risk, ws.raw_cog = r
+    pname = ws.detected_name or ws.name
+    ws.pm_out   = safe_parse_json(r[0], pm_fallback(pname))
+    ws.risk_out = safe_parse_json(r[1], risk_fallback(pname))
+    ws.cog_out  = safe_parse_json(r[2], cog_fallback(pname))
+    ws.rag.write_agent_output("pm",   ws.pm_out)
+    ws.rag.write_agent_output("risk", ws.risk_out)
+    ws.rag.write_agent_output("cog",  ws.cog_out)
+    if ws.pm_out.get("project_name"):
+        ws.detected_name = ws.pm_out["project_name"]
+    ws.gates[2] = "pending"
+    ws.stage = 2
+
+def run_arbitration(ws, revision=""):
+    msg = (f"PM:\n{json.dumps(ws.pm_out, indent=2)}\n\n"
+           f"RISK:\n{json.dumps(ws.risk_out, indent=2)}\n\n"
+           f"STAKEHOLDER:\n{json.dumps(ws.cog_out, indent=2)}")
+    if revision:
+        msg = f"REVISION REQUEST:\n{revision}\n\n---\n{msg}"
+    with st.spinner("⚖️ Conflict arbitration..."):
+        ws.arbitration_out = call_gemini(ARBITRATION_PROMPT, msg)
+    ws.gates[3] = "pending"
+    ws.stage = 3
+
+def run_reporting(ws, revision=""):
+    msg = (f"ARBITRATION:\n{ws.arbitration_out}\n\n"
+           f"PM DATA:\n{json.dumps(ws.pm_out, indent=2)}\n\n"
+           f"RISK DATA:\n{json.dumps(ws.risk_out, indent=2)}\n\n"
+           f"STAKEHOLDER DATA:\n{json.dumps(ws.cog_out, indent=2)}")
+    if revision:
+        msg = f"REVISION REQUEST:\n{revision}\n\n---\n{msg}"
+    with st.spinner("📋 Building SteerCo brief..."):
+        ws.report_out = call_gemini(REPORTING_PROMPT, msg)
+    ws.gates[4] = "pending"
+    ws.stage = 4
+
+# ════════════════════════════════════════════════════════════════
+#  GATE COMPONENT
+# ════════════════════════════════════════════════════════════════
+
+def render_gate(ws, gate_n, approve_label, sendback_label, on_approve, on_sendback):
+    state = ws.gates[gate_n]
+    if state == "approved":
+        st.success("✅ Gate approved — pipeline advancing")
+        return
+    if state == "sent_back":
+        st.warning(f"↩️ Revision {ws.revisions[gate_n]} sent — agent reprocessing...")
+        return
+    st.info("🔎 **Your turn — review critically before advancing. You are the provocateur.**")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button(f"✅ {approve_label}", type="primary",
+                     key=f"app_{gate_n}_{ws.name}"):
+            ws.gates[gate_n] = "approved"
+            on_approve()
+            st.rerun()
+    with c2:
+        notes = st.text_area("📝 Revision notes — be specific:",
+                             key=f"nt_{gate_n}_{ws.name}", height=70,
+                             placeholder="What exactly must change? Name the field, the error, the missing item.")
+        if st.button(f"↩️ {sendback_label}", key=f"sb_{gate_n}_{ws.name}"):
+            if notes.strip():
+                ws.notes[gate_n] = notes.strip()
+                ws.revisions[gate_n] += 1
+                ws.gates[gate_n] = "sent_back"
+                on_sendback()
+                st.rerun()
+            else:
+                st.error("Add specific notes before sending back.")
+
+# ════════════════════════════════════════════════════════════════
+#  SESSION STATE INIT
+# ════════════════════════════════════════════════════════════════
+
+if "registry" not in st.session_state:
+    st.session_state.registry = {}
+if "active_id" not in st.session_state:
+    st.session_state.active_id = None
+
+def active_ws():
+    return st.session_state.registry.get(st.session_state.active_id)
+
+# ════════════════════════════════════════════════════════════════
+#  SIDEBAR — PROJECT REGISTRY
+# ════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## 🧭 PMO Intelligence")
-    st.caption("Phase 1 · Powered by Anthropic Claude")
+    st.markdown("## ⚓ PMO Command Center")
+    st.caption("Multi-project · Project-agnostic · Any sector")
     st.divider()
 
-    # ── API Key ──────────────────────────────────────────────────────────────
-    api_key = _resolve_api_key()
-    if not api_key:
-        st.markdown("### 🔑 API Key")
-        typed_key = st.text_input(
-            "Anthropic API Key",
-            type="password",
-            placeholder="sk-ant-...",
-            help="Set ANTHROPIC_API_KEY env var to avoid entering this each session.",
-            label_visibility="collapsed",
-        )
-        if typed_key:
-            st.session_state["_sidebar_api_key"] = typed_key
-            api_key = typed_key
-        if not api_key:
-            st.warning("API key required to run analysis.")
-        st.divider()
-    else:
-        st.success("🔑 API key detected", icon="✅")
-        st.divider()
-
-    # ── Run Status ───────────────────────────────────────────────────────────
-    if st.session_state["is_running"]:
-        st.markdown("### ⚙️ Agent Pipeline")
-        progress_map = st.session_state["agent_progress"]
-        status_icons = {"idle": "⬜", "running": "🟡", "done": "✅", "error": "🔴"}
-        agent_labels = {
-            "ProjectSummaryAgent":    "📊 Project Analysis",
-            "MethodologyAgent":       "🔄 Methodology",
-            "GoNoGoAgent":            "✅ Go/No-Go",
-            "SiteReadinessAgent":     "🏗 Site Readiness",
-            "ExecutiveSummaryAgent":  "📋 Executive Summary",
-        }
-        for name, label in agent_labels.items():
-            status = progress_map.get(name, "idle")
-            icon   = status_icons.get(status, "⬜")
-            st.caption(f"{icon} {label}")
-        st.divider()
-
-    # ── Last Run Summary ─────────────────────────────────────────────────────
-    if st.session_state["report"] and st.session_state["run_timestamp"]:
-        report: PipelineReport = st.session_state["report"]
-        ts = st.session_state["run_timestamp"].strftime("%d %b %Y %H:%M")
-        st.markdown("### 📌 Last Run")
-        st.caption(f"**{ts}**")
-
-        # Project name
-        if report.project_summary.succeeded and isinstance(report.project_summary.output, dict):
-            pname = report.project_summary.output.get("project_name", "")
-            if pname:
-                st.caption(f"📁 {pname}")
-
-        # Go/No-Go quick badge
-        if report.go_no_go.succeeded and isinstance(report.go_no_go.output, dict):
-            dec = report.go_no_go.output.get("decision", "")
-            st.markdown(_go_badge(dec), unsafe_allow_html=True)
-
-        # Readiness quick score
-        if report.site_readiness.succeeded and isinstance(report.site_readiness.output, dict):
-            pct = report.site_readiness.output.get("readiness_pct")
-            if pct is not None:
-                st.markdown(
-                    f"🏗 Readiness: **{pct:.0f}%**"
-                    + _readiness_bar(pct),
-                    unsafe_allow_html=True,
-                )
-
-        st.caption(f"⏱ {report.total_elapsed_ms / 1000:.1f}s total pipeline")
-        st.divider()
-
-    # ── About ────────────────────────────────────────────────────────────────
-    with st.expander("ℹ️ About Phase 1"):
-        st.markdown("""
-**PMO Intelligence Platform — Phase 1**
-
-Five specialist AI agents analyse any project document:
-- **Project Summary** — structured brief extraction
-- **Methodology** — delivery framework recommendation
-- **Go/No-Go** — viability gate with scoring
-- **Site Readiness** — operational readiness check
-- **Executive Summary** — board-ready synthesis
-
-**Phase 2 (coming):** Conversational AI, multi-project workspace, voice input, RAG memory.
-        """)
-
-    # ── Phase 2 Hook: Conversational AI placeholder ──────────────────────────
-    # Phase 2: replace this block with st.chat_input + agent router
-    st.markdown("---")
-    st.caption("💬 Conversational AI — Phase 2")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN HEADER
-# ══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("# 🧭 PMO Intelligence Platform")
-st.caption("Multi-agent project analysis · Anthropic Claude · Phase 1")
-
-if st.session_state["is_running"]:
-    st.info("⚙️ Analysis pipeline running — results will appear below when complete.")
-    st.rerun()  # Streamlit polling to reflect agent progress
-
-if st.session_state.get("_pipeline_error"):
-    st.error(
-        f"**Pipeline Error:** {st.session_state['_pipeline_error']}\n\n"
-        "Check your API key and try again."
-    )
-    del st.session_state["_pipeline_error"]
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TABS
-# ══════════════════════════════════════════════════════════════════════════════
-
-TAB_LABELS = [
-    "📥 Input",
-    "📊 Analysis",
-    "🔄 Methodology",
-    "✅ Go/No-Go",
-    "🏗 Site Readiness",
-    "📋 Executive Summary",
-]
-
-tabs = st.tabs(TAB_LABELS)
-
-
-# ═══════════════════════════════════════════════════════════
-#  TAB 0 — INPUT
-# ═══════════════════════════════════════════════════════════
-
-with tabs[0]:
-    st.markdown(
-        '<div class="section-header">Project Input</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "Paste any project document — SOW, bid doc, status report, meeting notes, "
-        "brief — or upload a text file. Works on any project in any sector."
-    )
-
-    # ── Input method ──────────────────────────────────────────────────────────
-    input_method = st.radio(
-        "Input method:",
-        ["✏️ Paste text", "📎 Upload file"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    project_text  = ""
-    source_type   = "text"
-    upload_name   = None
-
-    if input_method == "✏️ Paste text":
-        project_text = st.text_area(
-            "Project document",
-            height=320,
-            placeholder=(
-                "Paste your project document here...\n\n"
-                "Examples:\n"
-                "• Statement of Work (SOW)\n"
-                "• Bid or tender document\n"
-                "• Project status report\n"
-                "• Meeting minutes / MoM\n"
-                "• Project brief or charter\n"
-                "• Discovery findings\n\n"
-                "The agents extract objectives, risks, stakeholders, milestones, "
-                "and constraints from whatever you provide."
-            ),
-            label_visibility="collapsed",
-        )
-        source_type = "text"
-
-    else:
-        uploaded = st.file_uploader(
-            "Upload project document",
-            type=["txt", "md", "csv"],
-            help="Plain text files only (Phase 1). PDF and DOCX support in Phase 2.",
-            label_visibility="collapsed",
-        )
-        if uploaded:
-            try:
-                project_text = io.StringIO(
-                    uploaded.read().decode("utf-8", errors="ignore")
-                ).read()
-                source_type  = "file"
-                upload_name  = uploaded.name
-                st.success(
-                    f"✅ Loaded: **{uploaded.name}** "
-                    f"({len(project_text):,} characters)"
-                )
-                with st.expander("Preview (first 500 chars)"):
-                    st.text(project_text[:500] + ("..." if len(project_text) > 500 else ""))
-            except Exception as exc:
-                st.error(f"Could not read file: {exc}")
-
-        # Phase 2 note
-        st.caption(
-            "📌 Phase 2: PDF, DOCX, and voice note upload coming. "
-            "Plain text and Markdown supported now."
-        )
-
-    st.divider()
-
-    # ── Validation & Run ──────────────────────────────────────────────────────
-    col_btn, col_info = st.columns([2, 5])
-
-    with col_btn:
-        run_clicked = st.button(
-            "🚀 Analyse Project",
-            type="primary",
-            use_container_width=True,
-            disabled=st.session_state["is_running"] or not api_key,
-        )
-
-    with col_info:
-        if not api_key:
-            st.warning("⚠️ Add your Anthropic API key in the sidebar to run.")
-        elif not project_text.strip():
-            st.info("Paste or upload project content above, then click Analyse.")
-        elif st.session_state["report"]:
-            ts = st.session_state["run_timestamp"].strftime("%H:%M:%S")
-            st.success(
-                f"✅ Analysis complete ({ts}). "
-                "Navigate tabs to review results, or run again with new input."
+    st.markdown("### ➕ New Project")
+    new_name = st.text_input("Project name:",
+                              placeholder="e.g. Amcor DC Hosting, Bridge Phase 2",
+                              key="new_name", label_visibility="collapsed")
+    if st.button("Create Project", use_container_width=True, type="primary"):
+        if new_name.strip():
+            pid = f"proj_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+            st.session_state.registry[pid] = ProjectWorkspace(
+                name=new_name.strip(),
+                created=datetime.now().strftime("%d %b %Y %H:%M")
             )
-
-    if run_clicked:
-        text = project_text.strip()
-        if not text:
-            st.error("No content to analyse. Paste text or upload a file first.")
-        elif not api_key:
-            st.error("API key missing. Add it in the sidebar.")
-        else:
-            # Launch pipeline in background thread so Streamlit stays responsive
-            t = threading.Thread(
-                target=_run_pipeline,
-                kwargs={
-                    "text":        text,
-                    "api_key":     api_key,
-                    "source_type": source_type,
-                    "filename":    upload_name,
-                },
-                daemon=True,
-            )
-            t.start()
+            st.session_state.active_id = pid
             st.rerun()
+        else:
+            st.error("Enter a project name.")
 
-    # ── Placeholder content when no results yet ───────────────────────────────
-    if not st.session_state["report"] and not st.session_state["is_running"]:
+    st.divider()
+    reg = st.session_state.registry
+    if reg:
+        st.markdown("### 📁 Projects")
+        for pid, ws in reg.items():
+            is_active = pid == st.session_state.active_id
+            icons = ["📄","🎖","⚙️","⚖️","📋","✅"]
+            s_icon = icons[min(ws.stage, 5)]
+            if st.button(
+                f"{'▶ ' if is_active else ''}{ws.name}\n{s_icon} Stage {ws.stage}",
+                key=f"sel_{pid}", use_container_width=True,
+                type="primary" if is_active else "secondary"
+            ):
+                st.session_state.active_id = pid
+                st.rerun()
+            if is_active:
+                if st.button("🗑 Delete", key=f"del_{pid}", use_container_width=True):
+                    del st.session_state.registry[pid]
+                    remaining = list(st.session_state.registry.keys())
+                    st.session_state.active_id = remaining[0] if remaining else None
+                    st.rerun()
+    else:
+        st.info("No projects yet.\nCreate one above ☝")
+
+    st.divider()
+    ws_sidebar = active_ws()
+    if ws_sidebar and ws_sidebar.rag.audit_log:
+        st.markdown("### 📋 Audit Log")
+        for entry in ws_sidebar.rag.audit_log[-8:]:
+            st.caption(entry)
+
+# ════════════════════════════════════════════════════════════════
+#  WELCOME SCREEN (no project selected)
+# ════════════════════════════════════════════════════════════════
+
+ws = active_ws()
+if ws is None:
+    st.title("⚓ Multi-Agent PMO Command Center")
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    col1.markdown("""
+**🎖 Captain Sinbad**
+Orchestrator — parses any project document, routes data to specialist agents, arbitrates conflicts
+    """)
+    col2.markdown("""
+**⚙️ Three Parallel Agents**
+PM Controls (EVM + WBS) · Risk & Tech (RAID + RACI) · Stakeholder Advisor — run concurrently
+    """)
+    col3.markdown("""
+**🔎 Human Gating**
+You approve or send back at every stage. You are the provocateur — the system does the work, you validate
+    """)
+    st.info("👈 **Create a project in the sidebar to begin.** Works on any SOW, Bid Doc, Status Report or Voice Note.")
+    st.stop()
+
+# ════════════════════════════════════════════════════════════════
+#  ACTIVE PROJECT — HEADER
+# ════════════════════════════════════════════════════════════════
+
+st.title(f"⚓ {ws.name}")
+info_parts = [f"Created: {ws.created}"]
+if ws.detected_name and ws.detected_name != ws.name:
+    info_parts.insert(0, f"Detected: {ws.detected_name}")
+if ws.detected_client:
+    info_parts.insert(1, f"Client: {ws.detected_client}")
+st.caption("  |  ".join(info_parts))
+
+# Stage progress
+stage_labels = [("📄","Input"),("🎖","Orchestrate"),("⚙️","Agents"),
+                ("⚖️","Arbitrate"),("📋","Report"),("✅","Released")]
+cols = st.columns(6)
+for i, (col, (icon, label)) in enumerate(zip(cols, stage_labels)):
+    if i == ws.stage:
+        col.markdown(f"<div style='text-align:center;padding:5px;background:#378ADD18;border:1.5px solid #378ADD;border-radius:8px;font-size:12px;font-weight:500'>{icon}<br>{label}</div>", unsafe_allow_html=True)
+    elif i < ws.stage:
+        col.markdown(f"<div style='text-align:center;padding:5px;background:#1D9E7518;border:1px solid #1D9E75;border-radius:8px;font-size:12px;color:#1D9E75'>✓<br>{label}</div>", unsafe_allow_html=True)
+    else:
+        col.markdown(f"<div style='text-align:center;padding:5px;border:1px solid #ccc;border-radius:8px;font-size:12px;color:#aaa'>{icon}<br>{label}</div>", unsafe_allow_html=True)
+
+st.divider()
+
+# ════════════════════════════════════════════════════════════════
+#  STAGE 0 — INPUT
+# ════════════════════════════════════════════════════════════════
+
+with st.expander("📄 Stage 0 — Input Document", expanded=(ws.stage == 0)):
+    existing = ws.rag.source_store
+    if existing:
+        st.success(f"✅ {len(existing)} document(s) loaded for this project.")
+        for doc in existing.values():
+            st.caption(f"📄 {doc['label']} — {doc['timestamp'][:19]}")
+        st.markdown("**Add another document** (optional — appends to project context):")
+
+    raw_input = st.text_area(
+        "Paste your document:",
+        height=200,
+        key=f"inp_{ws.name}",
+        placeholder=(
+            "Paste any project document — SOW, bid doc, status report, MoM, voice note transcript...\n\n"
+            "Works on any project in any sector. The agents will extract:\n"
+            "• Financial baselines + EVM metrics\n"
+            "• RAID register + RACI matrix\n"
+            "• Stakeholder profiles + engagement plan\n"
+            "• SteerCo-ready brief\n\n"
+            "No hardcoded project — fully adapts to whatever you paste."
+        )
+    )
+    doc_label = st.text_input("Document label:",
+                              value="SOW", key=f"lbl_{ws.name}",
+                              placeholder="SOW, Status Report, MoM, Voice Note, Bid Doc")
+
+    if st.button("🚀 Run Pipeline", type="primary", key=f"run_{ws.name}"):
+        if raw_input.strip():
+            ws.rag.ingest_source(raw_input.strip(), doc_label or "document")
+            # Reset pipeline state
+            ws.stage = 0
+            ws.orchestrator_out = ws.pm_out = ws.risk_out = None
+            ws.cog_out = ws.arbitration_out = ws.report_out = None
+            ws.raw_pm = ws.raw_risk = ws.raw_cog = ""
+            ws.gates = {1:"pending", 2:"pending", 3:"pending", 4:"pending"}
+            ws.notes = {1:"", 2:"", 3:"", 4:""}
+            ws.revisions = {1:0, 2:0, 3:0, 4:0}
+            run_orchestrator(ws)
+            st.rerun()
+        else:
+            st.error("Paste a document before running.")
+
+# ════════════════════════════════════════════════════════════════
+#  STAGE 1 — ORCHESTRATOR + GATE 1
+# ════════════════════════════════════════════════════════════════
+
+if ws.stage >= 1 and ws.orchestrator_out:
+    icon = "✅" if ws.gates[1] == "approved" else "🔎"
+    with st.expander(f"🎖 Stage 1 — Orchestrator Directive {icon}",
+                     expanded=(ws.stage == 1)):
+        if ws.revisions[1]:
+            st.caption(f"Revision {ws.revisions[1]}: _{ws.notes[1]}_")
+        st.markdown(ws.orchestrator_out)
         st.divider()
-        st.markdown(
-            '<div class="section-header">What the platform delivers</div>',
-            unsafe_allow_html=True,
-        )
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("""
-**📊 Structured Analysis**
-Extracts objectives, stakeholders, scope, constraints, risks, and gaps from any unstructured text.
-            """)
-        with c2:
-            st.markdown("""
-**🔄 Methodology Fit**
-Recommends Agile, Waterfall, Hybrid, PRINCE2, SAFe, or Iterative based on project characteristics.
-            """)
-        with c3:
-            st.markdown("""
-**✅ Go/No-Go Gate**
-Scores five viability dimensions and issues a clear GO / NO-GO / CONDITIONAL decision.
-            """)
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            st.markdown("""
-**🏗 Site Readiness**
-Checks infrastructure, staffing, access, approvals, vendors, and tooling before you commit to delivery.
-            """)
-        with c5:
-            st.markdown("""
-**📋 Executive Summary**
-Board-ready synthesis: decision, top risks, and recommended actions — in 90 seconds of reading.
-            """)
-        with c6:
-            st.markdown("""
-**🔮 Phase 2 Ready**
-Conversational AI, RAG memory, multi-project workspace, and voice input are wired in, not bolted on.
-            """)
-
-
-# ═══════════════════════════════════════════════════════════
-#  TAB 1 — PROJECT ANALYSIS
-# ═══════════════════════════════════════════════════════════
-
-with tabs[1]:
-    st.markdown(
-        '<div class="section-header">Project Analysis</div>',
-        unsafe_allow_html=True,
-    )
-
-    report: Optional[PipelineReport] = st.session_state["report"]
-
-    if st.session_state["is_running"]:
-        with st.spinner("📊 Project Summary Agent is running..."):
-            st.stop()
-
-    if not report:
-        st.info("Run an analysis from the **📥 Input** tab to see results here.")
-        st.stop()
-
-    result = report.project_summary
-
-    if not result.succeeded:
-        _render_agent_error(result)
-        st.stop()
-
-    data = result.output if isinstance(result.output, dict) else {}
-    brief = data.get("full_brief", str(result.output))
-
-    # Project name callout
-    pname = data.get("project_name", "")
-    if pname:
-        st.success(f"**Project identified:** {pname}")
-
-    # Agent reasoning (collapsible)
-    with st.expander("🧠 Agent Reasoning", expanded=False):
-        st.caption(result.reasoning)
-
-    st.markdown(brief)
-    _render_elapsed(result)
-
-
-# ═══════════════════════════════════════════════════════════
-#  TAB 2 — METHODOLOGY
-# ═══════════════════════════════════════════════════════════
-
-with tabs[2]:
-    st.markdown(
-        '<div class="section-header">Delivery Methodology Recommendation</div>',
-        unsafe_allow_html=True,
-    )
-
-    if st.session_state["is_running"]:
-        with st.spinner("🔄 Methodology Agent is running..."):
-            st.stop()
-
-    if not report:
-        st.info("Run an analysis from the **📥 Input** tab to see results here.")
-        st.stop()
-
-    result = report.methodology
-
-    if not result.succeeded:
-        _render_agent_error(result)
-        st.stop()
-
-    data = result.output if isinstance(result.output, dict) else {}
-    methodology = data.get("methodology", "Undetermined")
-    confidence  = data.get("confidence", "Medium")
-    full_text   = data.get("full_analysis", str(result.output))
-
-    # Headline metric
-    col_m, col_c, col_sp = st.columns([3, 2, 4])
-    with col_m:
-        st.markdown(
-            _metric_card("Recommended Methodology", methodology),
-            unsafe_allow_html=True,
-        )
-    with col_c:
-        conf_colour = {"High": "#10b981", "Medium": "#f59e0b", "Low": "#ef4444"}.get(
-            confidence, "#6b7280"
-        )
-        st.markdown(
-            _metric_card(
-                "Confidence",
-                confidence,
-                sub=f"<span style='color:{conf_colour}'>●</span> {confidence} confidence",
-            ),
-            unsafe_allow_html=True,
+        render_gate(ws, 1,
+            "Approve routing — dispatch agents",
+            "Send back to Orchestrator",
+            on_approve=lambda: run_agents(ws),
+            on_sendback=lambda: run_orchestrator(ws, ws.notes[1])
         )
 
-    st.divider()
+# ════════════════════════════════════════════════════════════════
+#  STAGE 2 — AGENTS + GATE 2
+# ════════════════════════════════════════════════════════════════
 
-    with st.expander("🧠 Agent Reasoning", expanded=False):
-        st.caption(result.reasoning)
+if ws.stage >= 2 and ws.pm_out:
+    icon = "✅" if ws.gates[2] == "approved" else "🔎"
+    with st.expander(f"⚙️ Stage 2 — Agent Outputs {icon}",
+                     expanded=(ws.stage == 2)):
+        if ws.revisions[2]:
+            st.caption(f"Revision {ws.revisions[2]}: _{ws.notes[2]}_")
 
-    st.markdown(full_text)
-    _render_elapsed(result)
+        t_pm, t_risk, t_cog, t_dbg = st.tabs(
+            ["📊 PM & Controls", "🛡 Risk & Tech", "🧠 Stakeholder", "🔍 Debug"])
 
+        # ── PM ──────────────────────────────────────────
+        with t_pm:
+            pm = ws.pm_out
+            evm = pm.get("evm_summary", {})
+            cur = pm.get("currency", "")
+            if pm.get("project_name"):
+                ws.detected_name = pm["project_name"]
+                st.info(f"📌 **{pm['project_name']}** | {cur} | Period: {pm.get('period','?')}")
 
-# ═══════════════════════════════════════════════════════════
-#  TAB 3 — GO / NO-GO
-# ═══════════════════════════════════════════════════════════
+            spi = safe_num(evm.get("spi"))
+            cpi = safe_num(evm.get("cpi"))
 
-with tabs[3]:
-    st.markdown(
-        '<div class="section-header">Go / No-Go Assessment</div>',
-        unsafe_allow_html=True,
-    )
+            c1,c2,c3,c4,c5 = st.columns(5)
+            c1.metric("BAC", f"{cur} {safe_num(evm.get('bac')):,.1f}")
+            c2.metric("SPI", f"{spi:.3f}",
+                      delta="⚠ BREACH" if 0 < spi < 0.95 else ("N/A" if spi==0 else "OK"),
+                      delta_color="inverse" if 0 < spi < 0.95 else "off")
+            c3.metric("CPI", f"{cpi:.3f}",
+                      delta="⚠ BREACH" if 0 < cpi < 0.95 else ("N/A" if cpi==0 else "OK"),
+                      delta_color="inverse" if 0 < cpi < 0.95 else "off")
+            c4.metric("EAC", f"{cur} {safe_num(evm.get('eac')):,.1f}")
+            c5.metric("TCPI", f"{safe_num(evm.get('tcpi')):.3f}")
 
-    if st.session_state["is_running"]:
-        with st.spinner("✅ Go/No-Go Agent is running..."):
-            st.stop()
+            if evm.get("governance_breach"):
+                st.error("🚨 Governance breach — SPI or CPI below 0.95")
 
-    if not report:
-        st.info("Run an analysis from the **📥 Input** tab to see results here.")
-        st.stop()
+            pkgs = pm.get("wbs_packages", [])
+            if pkgs:
+                st.subheader("WBS Packages")
+                for p in pkgs:
+                    pct = safe_pct(p.get("pct_complete"))
+                    status = p.get("status","AMBER")
+                    s_icon = {"GREEN":"🟢","AMBER":"🟡","RED":"🔴"}.get(status,"🟡")
+                    st.markdown(f"**{p.get('id','?')} — {p.get('name','?')}** {s_icon}")
+                    ca, cb, cc = st.columns([4,1,1])
+                    ca.progress(pct/100)
+                    cb.write(f"**{pct}%**")
+                    cc.write(f"{cur} {safe_num(p.get('spent')):,.1f} / {safe_num(p.get('budget')):,.1f}")
+                    if p.get("resource_flag"):
+                        st.caption(f"⚠ {p['resource_flag']}")
+            else:
+                st.info("No WBS packages found — check document or Debug tab.")
 
-    result = report.go_no_go
+            for gap in pm.get("data_gaps", []):
+                if gap:
+                    st.warning(f"Gap: {gap}")
+            for esc in pm.get("escalations", []):
+                if esc:
+                    st.error(f"🚨 {esc}")
 
-    if not result.succeeded:
-        _render_agent_error(result)
-        st.stop()
+        # ── Risk ─────────────────────────────────────────
+        with t_risk:
+            risk = ws.risk_out
+            raid = risk.get("raid_items", [])
+            sev_icon = {"CRITICAL":"🔴","HIGH":"🟡","MEDIUM":"🔵","LOW":"🟢"}
 
-    data      = result.output if isinstance(result.output, dict) else {}
-    decision  = data.get("decision", "INSUFFICIENT DATA")
-    comp_pct  = data.get("composite_pct")
-    full_text = data.get("full_analysis", str(result.output))
+            if raid:
+                st.subheader(f"RAID Register — {len(raid)} items")
+                for item in raid:
+                    sev = item.get("severity","MEDIUM")
+                    esc_flag = " 🚨 **Director escalation**" if item.get("director_escalation") else ""
+                    st.markdown(
+                        f"{sev_icon.get(sev,'•')} **{item.get('id','?')} "
+                        f"[{item.get('type','?')}]** — Score {item.get('exposure_score','?')} "
+                        f"({item.get('probability','?')}×{item.get('impact','?')}) — *{sev}*"
+                    )
+                    st.markdown(f"> {item.get('description','No description')}")
+                    st.caption(
+                        f"Owner: **{item.get('owner','?')}** | "
+                        f"Target: {item.get('target_closure','?')} | "
+                        f"Status: {item.get('status','?')}{esc_flag}"
+                    )
+                    st.divider()
+            else:
+                st.info("No RAID items found — check document or Debug tab.")
 
-    # Decision headline
-    col_d, col_s, col_sp = st.columns([3, 2, 4])
-    with col_d:
-        st.markdown(
-            f"### Decision\n\n{_go_badge(decision)}",
-            unsafe_allow_html=True,
+            for gap in risk.get("governance_gaps", []):
+                if gap:
+                    st.warning(f"⚠ Governance gap: {gap}")
+
+            raci = risk.get("raci_matrix", [])
+            if raci:
+                with st.expander("RACI Matrix"):
+                    for row in raci:
+                        roles = row.get("roles", {})
+                        st.markdown(f"**{row.get('wbs_id','?')} — {row.get('wbs_name','?')}**")
+                        st.markdown(" | ".join(f"{k}: **{v}**" for k,v in roles.items()))
+                    st.caption("A=Accountable · R=Responsible · C=Consulted · I=Informed")
+
+        # ── Stakeholder ──────────────────────────────────
+        with t_cog:
+            cog = ws.cog_out
+            stks = cog.get("stakeholders", [])
+            if stks:
+                for s in stks:
+                    score = safe_pct(s.get("engagement_score", 50))
+                    status = s.get("status","AMBER")
+                    s_icon = {"GREEN":"🟢","AMBER":"🟡","RED":"🔴"}.get(status,"🟡")
+                    st.markdown(f"{s_icon} **{s.get('name','?')}** — {s.get('role','?')}")
+                    ca, cb = st.columns([3,1])
+                    ca.progress(score/100, text=f"Engagement {score}/100")
+                    days = safe_num(s.get("last_contact_days",0))
+                    if s.get("overdue_flag"):
+                        cb.error(f"⚠ OVERDUE\n{int(days)}d ago")
+                    else:
+                        cb.success(f"Active\n{int(days)}d ago")
+                    with st.expander(f"Profile — {s.get('name','?')}"):
+                        st.caption(f"Authority: {s.get('authority','?')}")
+                        if s.get("stated_concerns"):
+                            st.markdown("**Concerns:** " + " · ".join(s["stated_concerns"]))
+                        if s.get("outstanding_commitments"):
+                            st.markdown("**Outstanding:** " + " · ".join(s["outstanding_commitments"]))
+                        if s.get("recommended_engagement"):
+                            st.info(s["recommended_engagement"])
+                    st.divider()
+            else:
+                st.info("No stakeholders found — check document or Debug tab.")
+
+            for item in cog.get("immediate_attention_required", []):
+                if item:
+                    st.error(f"🚨 Immediate: {item}")
+            for gap in cog.get("data_gaps", []):
+                if gap:
+                    st.warning(f"Gap: {gap}")
+
+        # ── Debug ─────────────────────────────────────────
+        with t_dbg:
+            st.caption("Raw LLM responses — use to diagnose parse failures")
+            st.text_area("PM Raw", ws.raw_pm, height=120, key="dbg_pm")
+            st.text_area("Risk Raw", ws.raw_risk, height=120, key="dbg_risk")
+            st.text_area("Cognitive Raw", ws.raw_cog, height=120, key="dbg_cog")
+
+        st.divider()
+        render_gate(ws, 2,
+            "Approve all outputs — proceed to arbitration",
+            "Send agents back for revision",
+            on_approve=lambda: run_arbitration(ws),
+            on_sendback=lambda: run_agents(ws, ws.notes[2])
         )
-    with col_s:
-        if comp_pct is not None:
-            score_colour = (
-                "#10b981" if comp_pct >= 70
-                else "#f59e0b" if comp_pct >= 45
-                else "#ef4444"
-            )
-            st.markdown(
-                _metric_card(
-                    "Composite Score",
-                    f"{comp_pct:.0f}%",
-                    sub=f"<span style='color:{score_colour}'>{'▲ Strong' if comp_pct >= 70 else '▼ Concern' if comp_pct < 45 else '~ Moderate'}</span>",
-                ),
-                unsafe_allow_html=True,
-            )
 
-    # Alert banner for NO-GO
-    if "NO-GO" in decision.upper() and "CONDITIONAL" not in decision.upper():
-        st.error(
-            "🚨 **NO-GO** — Delivery cannot proceed until critical blockers are resolved. "
-            "See the full assessment below."
-        )
-    elif "CONDITIONAL" in decision.upper():
-        st.warning(
-            "⚠️ **CONDITIONAL GO** — Conditions must be formally met and signed off "
-            "before committing to delivery. See conditions in the full assessment."
-        )
-    elif decision.upper() == "GO":
-        st.success("✅ **GO** — Project assessed as viable to proceed.")
+# ════════════════════════════════════════════════════════════════
+#  STAGE 3 — ARBITRATION + GATE 3
+# ════════════════════════════════════════════════════════════════
 
-    st.divider()
-
-    with st.expander("🧠 Agent Reasoning", expanded=False):
-        st.caption(result.reasoning)
-
-    st.markdown(full_text)
-    _render_elapsed(result)
-
-
-# ═══════════════════════════════════════════════════════════
-#  TAB 4 — SITE READINESS
-# ═══════════════════════════════════════════════════════════
-
-with tabs[4]:
-    st.markdown(
-        '<div class="section-header">Site & Operational Readiness</div>',
-        unsafe_allow_html=True,
-    )
-
-    if st.session_state["is_running"]:
-        with st.spinner("🏗 Site Readiness Agent is running..."):
-            st.stop()
-
-    if not report:
-        st.info("Run an analysis from the **📥 Input** tab to see results here.")
-        st.stop()
-
-    result = report.site_readiness
-
-    if not result.succeeded:
-        _render_agent_error(result)
-        st.stop()
-
-    data       = result.output if isinstance(result.output, dict) else {}
-    read_pct   = data.get("readiness_pct")
-    full_text  = data.get("full_analysis", str(result.output))
-
-    # Readiness score headline
-    if read_pct is not None:
-        col_r, col_rb, col_sp = st.columns([2, 4, 3])
-        with col_r:
-            label_colour = (
-                "#ef4444" if read_pct < 50
-                else "#f59e0b" if read_pct < 75
-                else "#10b981"
-            )
-            status_label = (
-                "Not Ready" if read_pct < 50
-                else "Partially Ready" if read_pct < 75
-                else "Ready"
-            )
-            st.markdown(
-                _metric_card(
-                    "Overall Readiness",
-                    f"{read_pct:.0f}%",
-                    sub=f"<span style='color:{label_colour}'>● {status_label}</span>",
-                ),
-                unsafe_allow_html=True,
-            )
-        with col_rb:
-            st.markdown("&nbsp;", unsafe_allow_html=True)  # spacer
-            st.markdown(
-                _readiness_bar(read_pct),
-                unsafe_allow_html=True,
-            )
-            st.caption(f"Readiness score: {read_pct:.0f} / 100")
-
-        if read_pct < 50:
-            st.error(
-                "🚨 **Low readiness** — Significant gaps exist. "
-                "Do not commit to delivery start until blockers are resolved."
-            )
-        elif read_pct < 75:
-            st.warning(
-                "⚠️ **Partial readiness** — Key domains require attention "
-                "before delivery can proceed safely."
-            )
+if ws.stage >= 3 and ws.arbitration_out:
+    icon = "✅" if ws.gates[3] == "approved" else "🔎"
+    with st.expander(f"⚖️ Stage 3 — Conflict Arbitration {icon}",
+                     expanded=(ws.stage == 3)):
+        if ws.revisions[3]:
+            st.caption(f"Revision {ws.revisions[3]}: _{ws.notes[3]}_")
+        arb = ws.arbitration_out
+        if "NO CONFLICTS DETECTED" in arb.upper():
+            st.success("✅ No conflicts — all agent outputs are consistent.")
         else:
-            st.success("✅ **Operationally ready** — No critical readiness blockers identified.")
-
-    st.divider()
-
-    with st.expander("🧠 Agent Reasoning", expanded=False):
-        st.caption(result.reasoning)
-
-    st.markdown(full_text)
-    _render_elapsed(result)
-
-
-# ═══════════════════════════════════════════════════════════
-#  TAB 5 — EXECUTIVE SUMMARY
-# ═══════════════════════════════════════════════════════════
-
-with tabs[5]:
-    st.markdown(
-        '<div class="section-header">Executive Summary</div>',
-        unsafe_allow_html=True,
-    )
-
-    if st.session_state["is_running"]:
-        with st.spinner(
-            "📋 Executive Summary Agent synthesising all outputs..."
-        ):
-            st.stop()
-
-    if not report:
-        st.info("Run an analysis from the **📥 Input** tab to see results here.")
-        st.stop()
-
-    result = report.executive_summary
-
-    if not result.succeeded:
-        _render_agent_error(result)
-        st.stop()
-
-    data         = result.output if isinstance(result.output, dict) else {}
-    dec_label    = data.get("decision_label", "")
-    full_summary = data.get("full_summary", str(result.output))
-
-    # Pipeline performance summary (board context)
-    if dec_label:
-        st.markdown(
-            f"**Top-line decision:** {_go_badge(dec_label)}",
-            unsafe_allow_html=True,
+            st.warning("⚖️ Conflicts found and arbitrated:")
+        st.markdown(arb)
+        st.divider()
+        render_gate(ws, 3,
+            "Approve arbitration — generate SteerCo brief",
+            "Re-arbitrate with additional notes",
+            on_approve=lambda: run_reporting(ws),
+            on_sendback=lambda: run_arbitration(ws, ws.notes[3])
         )
 
-    # Timestamp and pipeline stats
-    if st.session_state["run_timestamp"]:
-        ts = st.session_state["run_timestamp"].strftime("%d %b %Y at %H:%M")
-        col_ts, col_tp = st.columns([3, 2])
-        col_ts.caption(f"📅 Analysis run: {ts}")
-        col_tp.caption(f"⏱ Total pipeline: {report.total_elapsed_ms / 1000:.1f}s")
+# ════════════════════════════════════════════════════════════════
+#  STAGE 4 — REPORTING + GATE 4
+# ════════════════════════════════════════════════════════════════
 
-    st.divider()
-
-    # Full executive summary output
-    with st.expander("🧠 Agent Reasoning", expanded=False):
-        st.caption(result.reasoning)
-
-    st.markdown(full_summary)
-
-    st.divider()
-
-    # ── Export ────────────────────────────────────────────────────────────────
-    st.markdown(
-        '<div class="section-header">Export</div>',
-        unsafe_allow_html=True,
-    )
-    col_dl, col_cp = st.columns([2, 3])
-
-    # Build full markdown export
-    full_export_parts = ["# PMO Intelligence Report\n"]
-    full_export_parts.append(
-        f"**Generated:** {st.session_state['run_timestamp'].strftime('%d %b %Y %H:%M') if st.session_state['run_timestamp'] else 'N/A'}\n"
-    )
-    full_export_parts.append("---\n")
-
-    section_map = [
-        ("📊 Project Analysis",      report.project_summary,  "full_brief"),
-        ("🔄 Methodology",           report.methodology,      "full_analysis"),
-        ("✅ Go/No-Go Assessment",   report.go_no_go,         "full_analysis"),
-        ("🏗 Site Readiness",        report.site_readiness,   "full_analysis"),
-        ("📋 Executive Summary",     report.executive_summary,"full_summary"),
-    ]
-
-    for heading, ag_result, key in section_map:
-        full_export_parts.append(f"## {heading}\n")
-        if ag_result.succeeded and isinstance(ag_result.output, dict):
-            content = ag_result.output.get(key, "")
-        elif ag_result.succeeded:
-            content = str(ag_result.output)
+if ws.stage >= 4 and ws.report_out:
+    gate_txt = "✅ APPROVED" if ws.gates[4] == "approved" else "🔒 PENDING APPROVAL"
+    with st.expander(f"📋 Stage 4 — SteerCo Brief — {gate_txt}",
+                     expanded=(ws.stage >= 4)):
+        if ws.revisions[4]:
+            st.caption(f"Revision {ws.revisions[4]}: _{ws.notes[4]}_")
+        if ws.gates[4] != "approved":
+            st.error("🔒 PENDING PM DIRECTOR APPROVAL — DO NOT DISTRIBUTE\n\n"
+                     "You are the final checkpoint. Review every section before approving.")
+        st.markdown(ws.report_out)
+        st.divider()
+        if ws.gates[4] == "approved":
+            ws.stage = 5
+            st.success("🎉 Approved and cleared for client distribution.")
         else:
-            content = f"*Error: {ag_result.error}*"
-        full_export_parts.append(content + "\n\n---\n")
+            render_gate(ws, 4,
+                "FINAL APPROVAL — I have reviewed and cleared for distribution",
+                "Send back to Reporting Engine",
+                on_approve=lambda: setattr(ws, "stage", 5),
+                on_sendback=lambda: run_reporting(ws, ws.notes[4])
+            )
 
-    export_md = "\n".join(full_export_parts)
+# ════════════════════════════════════════════════════════════════
+#  STAGE 5 — COMPLETE
+# ════════════════════════════════════════════════════════════════
 
-    with col_dl:
-        st.download_button(
-            label="⬇️ Download Full Report (.md)",
-            data=export_md,
-            file_name=f"pmo_report_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-
-    with col_cp:
-        st.text_area(
-            "Copy report text:",
-            value=full_summary,
-            height=150,
-            label_visibility="visible",
-        )
-
-    _render_elapsed(result)
+if ws.stage == 5:
+    st.success(f"🎉 **{ws.name} — Complete. SteerCo brief approved for distribution.**")
+    if st.button("🔄 Run again with updated document", key="rerun_btn"):
+        ws.stage = 0
+        ws.gates = {1:"pending",2:"pending",3:"pending",4:"pending"}
+        ws.orchestrator_out=ws.pm_out=ws.risk_out=None
+        ws.cog_out=ws.arbitration_out=ws.report_out=None
+        st.rerun()
