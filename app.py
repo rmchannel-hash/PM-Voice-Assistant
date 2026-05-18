@@ -6,7 +6,7 @@ Multiple projects supported — each fully isolated with its own RAG stores.
 Human-in-the-loop gating at every pipeline stage.
 
 Setup:
-  .streamlit/secrets.toml  →  ANTHROPIC_API_KEY = "your-key"
+  .streamlit/secrets.toml  ->  ANTHROPIC_API_KEY = "your-key"
 """
 
 import os
@@ -17,8 +17,6 @@ import re
 import threading
 import time
 from datetime import datetime
-
-st.set_page_config(page_title="PMO Command Center", page_icon="⚓", layout="wide")
 
 # ════════════════════════════════════════════════════════════════
 #  API KEY RESOLUTION
