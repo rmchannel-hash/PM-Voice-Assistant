@@ -1,3 +1,8 @@
+import streamlit as st
+     import anthropic
+
+     st.title("Anthropic Package Test")
+     st.write(f"Anthropic version: {anthropic.__version__}")
 """
 app.py — Phase 1 Stabilized
 =============================

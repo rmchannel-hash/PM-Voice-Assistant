@@ -8,3 +8,4 @@ openai-whisper
 pyttsx3
 numpy
 pandas
+anthropic
