@@ -6,12 +6,11 @@ Multiple projects supported — each fully isolated with its own RAG stores.
 Human-in-the-loop gating at every pipeline stage.
 
 Setup:
-  .streamlit/secrets.toml  →  ANTHROPIC_API_KEY = "your-key"
+  .streamlit/secrets.toml  →  GEMINI_API_KEY = "your-key"
 """
 
-import os
 import streamlit as st
-import anthropic
+import google.generativeai as genai
 import json
 import re
 import threading
@@ -20,22 +19,12 @@ from datetime import datetime
 
 st.set_page_config(page_title="PMO Command Center", page_icon="⚓", layout="wide")
 
-# ════════════════════════════════════════════════════════════════
-#  API KEY RESOLUTION
-# ════════════════════════════════════════════════════════════════
-
-def get_api_key():
-    """Priority: env var → streamlit secrets → sidebar input."""
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if key:
-        return key
-    try:
-        key = st.secrets.get("ANTHROPIC_API_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
-    return st.session_state.get("_api_key_input", "")
+# ── API KEY ──────────────────────────────────────────────────────
+try:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+except Exception:
+    st.error("GEMINI_API_KEY missing. Add to .streamlit/secrets.toml")
+    st.stop()
 
 # ════════════════════════════════════════════════════════════════
 #  PROJECT-AGNOSTIC PROMPTS
@@ -61,7 +50,7 @@ STEP 4 — DELEGATE CONCURRENTLY to three agents:
 
 STEP 5 — FLAG CONFLICTS: Note any structural conflicts between data elements (e.g. timeline vs resource availability).
 
-STEP 6 — ESCALATE: SPI < 0.95, CPI < 0.95, or any risk >=20 on 5x5 P×I → Director Escalation with named owner.
+STEP 6 — ESCALATE: SPI < 0.95, CPI < 0.95, or any risk ≥20 on 5x5 P×I → Director Escalation with named owner.
 
 REVISION: If REVISION REQUEST is included, address each point explicitly first.
 
@@ -349,57 +338,40 @@ def cog_fallback(name=""):
     }
 
 # ════════════════════════════════════════════════════════════════
-#  ANTHROPIC CALLER  (replaces Gemini)
+#  GEMINI CALLER
 # ════════════════════════════════════════════════════════════════
 
-def call_claude(system_prompt, user_msg):
-    """Call Anthropic Claude API with retry and error handling."""
-    key = get_api_key()
-    if not key:
-        return "ERROR: No API key. Add ANTHROPIC_API_KEY to .streamlit/secrets.toml"
-
-    client = anthropic.Anthropic(api_key=key)
-    backoff = [5, 15, 30, 60]
-
-    for attempt in range(4):
+def call_gemini(system_prompt, user_msg, model="gemini-2.5-flash"):
+    backoff = [15, 30, 60, 90]
+    for attempt in range(5):
         try:
-            response = client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=2048,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_msg}]
-            )
-            return response.content[0].text
-        except anthropic.RateLimitError:
-            if attempt < 3:
-                wait = backoff[attempt]
-                st.toast(f"Rate limit — waiting {wait}s (retry {attempt+1}/3)", icon="⏳")
-                time.sleep(wait)
-                continue
-            return "ERROR: Rate limit exceeded after retries."
-        except anthropic.AuthenticationError:
-            return "ERROR: Invalid API key. Check ANTHROPIC_API_KEY in secrets.toml"
+            m = genai.GenerativeModel(model_name=model,
+                                       system_instruction=system_prompt)
+            return m.generate_content(user_msg).text
         except Exception as e:
-            return f"ERROR: {str(e)}"
-
+            err = str(e)
+            if any(x in err for x in ["429", "quota", "rate"]):
+                if attempt < 4:
+                    wait = backoff[attempt]
+                    dm = re.search(r"(\d+(?:\.\d+)?)\s*s", err)
+                    if dm:
+                        wait = min(int(float(dm.group(1))) + 5, 120)
+                    st.toast(f"Rate limit — waiting {wait}s (retry {attempt+1}/4)", icon="⏳")
+                    time.sleep(wait)
+                    continue
+                return (f"QUOTA_EXCEEDED: Enable billing at https://aistudio.google.com "
+                        f"(costs < ₹5 for a demo)\n\nError: {err}")
+            return f"ERROR: {err}"
     return "ERROR: Max retries exceeded."
 
-
 def call_parallel(payloads):
-    """Run multiple Claude calls concurrently via threads."""
     results = [None] * len(payloads)
-
-    def worker(i, sp, um):
-        results[i] = call_claude(sp, um)
-
-    threads = [
-        threading.Thread(target=worker, args=(i, sp, um))
-        for i, (sp, um) in enumerate(payloads)
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    def worker(i, sp, um, mn):
+        results[i] = call_gemini(sp, um, mn)
+    threads = [threading.Thread(target=worker, args=(i, sp, um, mn))
+               for i, (sp, um, mn) in enumerate(payloads)]
+    for t in threads: t.start()
+    for t in threads: t.join()
     return results
 
 # ════════════════════════════════════════════════════════════════
@@ -410,7 +382,7 @@ def run_orchestrator(ws, revision=""):
     src = ws.rag.get_all_source_text()
     msg = f"REVISION REQUEST:\n{revision}\n\n---\nSOURCE:\n{src}" if revision else src
     with st.spinner("🎖 Captain Sinbad — analysing document..."):
-        ws.orchestrator_out = call_claude(ORCHESTRATOR_PROMPT, msg)
+        ws.orchestrator_out = call_gemini(ORCHESTRATOR_PROMPT, msg)
     ws.gates[1] = "pending"
     ws.stage = 1
 
@@ -422,9 +394,9 @@ def run_agents(ws, revision=""):
         return f"REVISION REQUEST:\n{revision}\n\n---\n{base}" if revision else base
     with st.spinner("📊 🛡 🧠  Running 3 agents in parallel..."):
         r = call_parallel([
-            (PM_PROMPT,        pay("PM_CONTROLS")),
-            (RISK_PROMPT,      pay("TECHNICAL_RISK")),
-            (COGNITIVE_PROMPT, pay("STAKEHOLDER")),
+            (PM_PROMPT,        pay("PM_CONTROLS"),    "gemini-2.5-flash"),
+            (RISK_PROMPT,      pay("TECHNICAL_RISK"), "gemini-2.5-flash"),
+            (COGNITIVE_PROMPT, pay("STAKEHOLDER"),    "gemini-2.5-flash"),
         ])
     ws.raw_pm, ws.raw_risk, ws.raw_cog = r
     pname = ws.detected_name or ws.name
@@ -446,7 +418,7 @@ def run_arbitration(ws, revision=""):
     if revision:
         msg = f"REVISION REQUEST:\n{revision}\n\n---\n{msg}"
     with st.spinner("⚖️ Conflict arbitration..."):
-        ws.arbitration_out = call_claude(ARBITRATION_PROMPT, msg)
+        ws.arbitration_out = call_gemini(ARBITRATION_PROMPT, msg)
     ws.gates[3] = "pending"
     ws.stage = 3
 
@@ -458,7 +430,7 @@ def run_reporting(ws, revision=""):
     if revision:
         msg = f"REVISION REQUEST:\n{revision}\n\n---\n{msg}"
     with st.spinner("📋 Building SteerCo brief..."):
-        ws.report_out = call_claude(REPORTING_PROMPT, msg)
+        ws.report_out = call_gemini(REPORTING_PROMPT, msg)
     ws.gates[4] = "pending"
     ws.stage = 4
 
@@ -516,24 +488,6 @@ with st.sidebar:
     st.markdown("## ⚓ PMO Command Center")
     st.caption("Multi-project · Project-agnostic · Any sector")
     st.divider()
-
-    # API Key input (if not set via env/secrets)
-    api_key = get_api_key()
-    if not api_key:
-        st.markdown("### 🔑 API Key")
-        st.text_input(
-            "Anthropic API Key",
-            type="password",
-            placeholder="sk-ant-...",
-            label_visibility="collapsed",
-            key="_api_key_input",
-            help="Or add ANTHROPIC_API_KEY to .streamlit/secrets.toml"
-        )
-        st.warning("⚠️ API key required to run analysis.")
-        st.divider()
-    else:
-        st.success("🔑 API key loaded", icon="✅")
-        st.divider()
 
     st.markdown("### ➕ New Project")
     new_name = st.text_input("Project name:",
@@ -618,7 +572,7 @@ if ws.detected_client:
     info_parts.insert(1, f"Client: {ws.detected_client}")
 st.caption("  |  ".join(info_parts))
 
-# Stage progress bar
+# Stage progress
 stage_labels = [("📄","Input"),("🎖","Orchestrate"),("⚙️","Agents"),
                 ("⚖️","Arbitrate"),("📋","Report"),("✅","Released")]
 cols = st.columns(6)
@@ -663,10 +617,9 @@ with st.expander("📄 Stage 0 — Input Document", expanded=(ws.stage == 0)):
                               placeholder="SOW, Status Report, MoM, Voice Note, Bid Doc")
 
     if st.button("🚀 Run Pipeline", type="primary", key=f"run_{ws.name}"):
-        if not get_api_key():
-            st.error("⚠️ No API key found. Add ANTHROPIC_API_KEY to .streamlit/secrets.toml")
-        elif raw_input.strip():
+        if raw_input.strip():
             ws.rag.ingest_source(raw_input.strip(), doc_label or "document")
+            # Reset pipeline state
             ws.stage = 0
             ws.orchestrator_out = ws.pm_out = ws.risk_out = None
             ws.cog_out = ws.arbitration_out = ws.report_out = None
@@ -712,6 +665,7 @@ if ws.stage >= 2 and ws.pm_out:
         t_pm, t_risk, t_cog, t_dbg = st.tabs(
             ["📊 PM & Controls", "🛡 Risk & Tech", "🧠 Stakeholder", "🔍 Debug"])
 
+        # ── PM ──────────────────────────────────────────
         with t_pm:
             pm = ws.pm_out
             evm = pm.get("evm_summary", {})
@@ -755,10 +709,13 @@ if ws.stage >= 2 and ws.pm_out:
                 st.info("No WBS packages found — check document or Debug tab.")
 
             for gap in pm.get("data_gaps", []):
-                if gap: st.warning(f"Gap: {gap}")
+                if gap:
+                    st.warning(f"Gap: {gap}")
             for esc in pm.get("escalations", []):
-                if esc: st.error(f"🚨 {esc}")
+                if esc:
+                    st.error(f"🚨 {esc}")
 
+        # ── Risk ─────────────────────────────────────────
         with t_risk:
             risk = ws.risk_out
             raid = risk.get("raid_items", [])
@@ -785,7 +742,8 @@ if ws.stage >= 2 and ws.pm_out:
                 st.info("No RAID items found — check document or Debug tab.")
 
             for gap in risk.get("governance_gaps", []):
-                if gap: st.warning(f"⚠ Governance gap: {gap}")
+                if gap:
+                    st.warning(f"⚠ Governance gap: {gap}")
 
             raci = risk.get("raci_matrix", [])
             if raci:
@@ -796,6 +754,7 @@ if ws.stage >= 2 and ws.pm_out:
                         st.markdown(" | ".join(f"{k}: **{v}**" for k,v in roles.items()))
                     st.caption("A=Accountable · R=Responsible · C=Consulted · I=Informed")
 
+        # ── Stakeholder ──────────────────────────────────
         with t_cog:
             cog = ws.cog_out
             stks = cog.get("stakeholders", [])
@@ -825,10 +784,13 @@ if ws.stage >= 2 and ws.pm_out:
                 st.info("No stakeholders found — check document or Debug tab.")
 
             for item in cog.get("immediate_attention_required", []):
-                if item: st.error(f"🚨 Immediate: {item}")
+                if item:
+                    st.error(f"🚨 Immediate: {item}")
             for gap in cog.get("data_gaps", []):
-                if gap: st.warning(f"Gap: {gap}")
+                if gap:
+                    st.warning(f"Gap: {gap}")
 
+        # ── Debug ─────────────────────────────────────────
         with t_dbg:
             st.caption("Raw LLM responses — use to diagnose parse failures")
             st.text_area("PM Raw", ws.raw_pm, height=120, key="dbg_pm")
